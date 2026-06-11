@@ -7,6 +7,7 @@ from multiprocessing.synchronize import Lock as LockType
 
 import vllm.v1.executor.multiproc_executor
 from vllm import envs
+from vllm_ascend import envs as envs_ascend
 from vllm.config import VllmConfig
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.utils.network_utils import get_distributed_init_method, get_loopback_ip, get_open_port
@@ -60,7 +61,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                 connect_ip=self.parallel_config.master_addr,
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
-        elif envs.VLLM_PP_NON_LEADER_ENGINE_CORE:
+        elif envs_ascend.VLLM_ASCEND_PDMIX_NON_LEADER_ENGINE_CORE:
             # For non-leader PP rank running with a passive EngineCore,
             # create a local rpc_broadcast_mq to broadcast SchedulerOutput
             # to local workers. Workers will use this MQ instead of
@@ -137,7 +138,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                         remote_message_queue = self.workers[0].peer_worker_response_mqs[rank]
                         assert remote_message_queue is not None
                         self.response_mqs.append(remote_message_queue)
-            elif envs.VLLM_PP_NON_LEADER_ENGINE_CORE:
+            elif envs_ascend.VLLM_ASCEND_PDMIX_NON_LEADER_ENGINE_CORE:
                 # For non-leader PP rank with passive EngineCore,
                 # collect local worker response mqs only.
                 for rank in range(self.local_world_size):
@@ -215,7 +216,7 @@ class AscendWorkerProc(WorkerProc):
             self.peer_response_handles = []
             self.local_rpc_broadcast_mq = None
             self.local_worker_response_mq = None
-        elif envs.VLLM_PP_NON_LEADER_ENGINE_CORE:
+        elif envs_ascend.VLLM_ASCEND_PDMIX_NON_LEADER_ENGINE_CORE:
             # Non-leader PP rank with passive EngineCore:
             # Dual MQ — local MQ for passive enginecore handshake +
             # cross-node MQ for actual communication with pp rank0.

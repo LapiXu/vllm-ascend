@@ -112,6 +112,30 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # PDMix: whether this process runs the non-leader PP passive engine core.
+    "VLLM_ASCEND_PDMIX_NON_LEADER_ENGINE_CORE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PDMIX_NON_LEADER_ENGINE_CORE", "0"))
+    ),
+    # PDMix: ZMQ address used by the leader PP rank to publish scheduler outputs.
+    "VLLM_ASCEND_PDMIX_SCHEDULER_ZMQ_ADDR": lambda: os.getenv(
+        "VLLM_ASCEND_PDMIX_SCHEDULER_ZMQ_ADDR", ""
+    ),
+    # PDMix: edge-cloud pre-output ZMQ port.
+    "VLLM_ASCEND_PDMIX_PRE_OUT_ZMQ_PORT": lambda: int(
+        os.getenv("VLLM_ASCEND_PDMIX_PRE_OUT_ZMQ_PORT", "5558")
+    ),
+    # PDMix: edge-cloud post-output ZMQ port.
+    "VLLM_ASCEND_PDMIX_POST_OUT_ZMQ_PORT": lambda: int(
+        os.getenv("VLLM_ASCEND_PDMIX_POST_OUT_ZMQ_PORT", "5559")
+    ),
+    # PDMix: local layer slice size. 0 disables layer slicing.
+    "VLLM_ASCEND_PDMIX_LAYER_SLICE_SIZE": lambda: int(
+        os.getenv("VLLM_ASCEND_PDMIX_LAYER_SLICE_SIZE", "0")
+    ),
+    # PDMix: passive scheduler dispatch policy.
+    "VLLM_ASCEND_PDMIX_PASSIVE_DISPATCH_POLICY": lambda: os.getenv(
+        "VLLM_ASCEND_PDMIX_PASSIVE_DISPATCH_POLICY", "expect_alternation"
+    ),
 }
 
 # end-env-vars-definition

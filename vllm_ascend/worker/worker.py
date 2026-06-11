@@ -48,12 +48,8 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.core.sched.output import (
-    BatchType,
-    GrammarOutput,
-    HiddenChannelType,
-    SchedulerOutput,
-)
+from vllm.v1.core.sched.output import SchedulerOutput, GrammarOutput
+from vllm_ascend.pdmix.sched.output import BatchType, HiddenChannelType
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors

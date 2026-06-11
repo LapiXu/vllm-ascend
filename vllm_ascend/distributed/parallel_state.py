@@ -2,7 +2,7 @@ from typing import Any, Callable
 
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
-from vllm.v1.core.sched.output import HiddenChannelType
+from vllm_ascend.pdmix.sched.output import HiddenChannelType
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     Handle,

@@ -19,6 +19,7 @@
 
 import math
 from vllm import envs
+import vllm_ascend.envs as envs_ascend
 import sys
 import time
 from collections import defaultdict
@@ -67,7 +68,8 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
-from vllm.v1.core.sched.output import BatchType, SchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm_ascend.pdmix.sched.output import BatchType
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -2122,7 +2124,7 @@ class NPUModelRunner(GPUModelRunner):
                 # captured full CUDAGraph.
                 if (
                     not get_pp_group().is_first_rank
-                    and envs.VLLM_LAYER_SLICE_SIZE > 0
+                    and envs_ascend.VLLM_ASCEND_PDMIX_LAYER_SLICE_SIZE > 0
                     and cudagraph_mode == CUDAGraphMode.FULL
                 ):
                     cudagraph_mode = CUDAGraphMode.NONE

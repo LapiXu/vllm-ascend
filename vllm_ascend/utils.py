@@ -440,6 +440,10 @@ def adapt_patch(is_global_patch: bool = False):
     else:
         from vllm_ascend.patch import worker  # noqa: F401
 
+    from vllm_ascend.pdmix import apply_pdmix_patches
+
+    apply_pdmix_patches(is_global_patch=is_global_patch)
+
 
 @functools.cache
 def vllm_version_is(target_vllm_version: str):

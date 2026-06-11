@@ -5,6 +5,10 @@ import importlib
 import sys
 import unittest
 from unittest.mock import patch, MagicMock
+from pathlib import Path
+
+# Repository root directory
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class TestModelPatches(unittest.TestCase):
@@ -112,7 +116,7 @@ class TestModelPatches(unittest.TestCase):
         import re
 
         # Get the patch directory
-        patch_dir = Path(__file__).parent.parent.parent / "vllm_ascend" / "pdmix" / "model_patches"
+        patch_dir = REPO_ROOT / "vllm_ascend" / "pdmix" / "model_patches"
 
         # Files to check
         patch_files = [
@@ -161,13 +165,7 @@ class TestModelPatches(unittest.TestCase):
         import os
         from pathlib import Path
 
-        patch_file = (
-            Path(__file__).parent.parent.parent
-            / "vllm_ascend"
-            / "pdmix"
-            / "model_patches"
-            / "qwen_config_compat.py"
-        )
+        patch_file = REPO_ROOT / "vllm_ascend" / "pdmix" / "model_patches" / "qwen_config_compat.py"
 
         with open(patch_file, "r", encoding="utf-8") as f:
             content = f.read()
@@ -211,6 +209,59 @@ class TestModelPatches(unittest.TestCase):
                     prop,
                     content,
                     f"Required property '{prop}' not found in qwen_config_compat.py"
+                )
+
+            # Check that removed properties are not in properties_to_add list
+            # Look for patterns like "<prop>" in the properties_to_add definition
+            import re
+            properties_to_add_match = re.search(r'properties_to_add\s*=\s*\[(.*?)\]', content, re.DOTALL)
+            if properties_to_add_match:
+                properties_list_str = properties_to_add_match.group(1)
+                for prop in removed_properties:
+                    self.assertNotIn(
+                        f'"{prop}"',
+                        properties_list_str,
+                        f"Removed property '{prop}' should not be in properties_to_add list"
+                    )
+                    self.assertNotIn(
+                        f"'{prop}'",
+                        properties_list_str,
+                        f"Removed property '{prop}' should not be in properties_to_add list"
+                    )
+
+    def test_qwen3_layer_slice_documentation(self):
+        """
+        Test that qwen3_layer_slice.py has proper documentation about inheriting
+        from Qwen2Model and does not contain direct layer slicing loops.
+        """
+        patch_file = REPO_ROOT / "vllm_ascend" / "pdmix" / "model_patches" / "qwen3_layer_slice.py"
+
+        with open(patch_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+            # Check that documentation mentions inheritance from Qwen2Model
+            self.assertIn(
+                "inherits from Qwen2Model",
+                content,
+                "qwen3_layer_slice.py should mention that Qwen3Model inherits from Qwen2Model"
+            )
+
+            # Check that there's no direct islice(self.layers) pattern
+            self.assertNotIn(
+                "islice(self.layers",
+                content,
+                "qwen3_layer_slice.py should not contain direct islice on self.layers"
+            )
+
+            # Check that original_forward is not called with layer_slice parameters
+            # (We already have a more general test, but this is specific to qwen3)
+            import re
+            original_forward_calls = re.findall(r'original_forward\([^)]*\)', content, re.DOTALL)
+            for call in original_forward_calls:
+                self.assertNotIn(
+                    "layer_slice",
+                    call,
+                    f"original_forward call should not contain layer_slice parameters: {call}"
                 )
 
 

@@ -13,6 +13,10 @@ def apply_patch() -> None:
     """
     Apply layer slicing patches for Qwen3 models.
     This function is idempotent - it can be called multiple times safely.
+
+    Note: Qwen3Model inherits from Qwen2Model, so we only need to patch
+    Qwen3ForCausalLM to pass layer_slice parameters to the already-patched
+    Qwen2Model.forward method.
     """
     try:
         from vllm.model_executor.models.qwen3 import Qwen3Model, Qwen3ForCausalLM

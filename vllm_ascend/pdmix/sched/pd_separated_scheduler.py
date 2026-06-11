@@ -281,14 +281,13 @@ class PDSeparatedScheduler:
         # since we don't have the full parent scheduler implementation
         scheduler_output = self._make_empty_batch()
 
-        # For pdmix compatibility, we keep the direct attribute setting
-        scheduler_output.batch_type = BatchType.PREFILL_FIRST
-        scheduler_output.head_token = uuid4().hex
-        scheduler_output.hidden_channel = (
-            self.hidden_channel_manager.allocate_prefill(
-                scheduler_output.head_token
-            )
-        )
+        head_token = uuid4().hex
+        hidden_channel = self.hidden_channel_manager.allocate_prefill(head_token)
+        set_pdmix_metadata(scheduler_output, PDMixSchedulerMetadata(
+            batch_type=BatchType.PREFILL_FIRST,
+            head_token=head_token,
+            hidden_channel=hidden_channel,
+        ))
         self.prefill_inflight_count += 1
 
         print(
@@ -416,12 +415,13 @@ class PDSeparatedScheduler:
 
         scheduler_output = self._make_empty_batch()
 
-        # For pdmix compatibility, we keep the direct attribute setting
-        scheduler_output.batch_type = BatchType.DECODE_FIRST
-        scheduler_output.head_token = uuid4().hex
-        scheduler_output.hidden_channel = (
-            self.hidden_channel_manager.decode_channel()
-        )
+        head_token = uuid4().hex
+        hidden_channel = self.hidden_channel_manager.decode_channel()
+        set_pdmix_metadata(scheduler_output, PDMixSchedulerMetadata(
+            batch_type=BatchType.DECODE_FIRST,
+            head_token=head_token,
+            hidden_channel=hidden_channel,
+        ))
         self._ensure_cached_all_token_ids(scheduler_output)
         self.decode_inflight_count += 1
 

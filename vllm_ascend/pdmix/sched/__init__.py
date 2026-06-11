@@ -14,6 +14,11 @@ from vllm_ascend.pdmix.sched.passive_scheduler import (
     PassiveScheduler,
     ScheduledBatch,
 )
+from vllm_ascend.pdmix.sched.pd_separated_scheduler import (
+    PrefillState,
+    HiddenChannelManager,
+    PDSeparatedScheduler,
+)
 
 __all__ = [
     "BatchType",
@@ -26,4 +31,7 @@ __all__ = [
     "LayerSliceInfo",
     "PassiveScheduler",
     "ScheduledBatch",
+    "PrefillState",
+    "HiddenChannelManager",
+    "PDSeparatedScheduler",
 ]

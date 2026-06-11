@@ -28,8 +28,7 @@ from typing import Optional
 
 import zmq
 
-from vllm_ascend import envs as envs_ascend
-from vllm_ascend.pdmix.sched.output import BatchType
+from vllm_ascend.pdmix.sched.output import BatchType, get_pdmix_metadata
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -80,7 +79,7 @@ class PPSchedulerZmqPublisher:
         """Queue a SchedulerOutput for publishing. Non-blocking: drops the
         message if the bridge queue is full (back-pressure protection).
         """
-        if not self._running or scheduler_output.batch_type is BatchType.EMPTY:
+        if not self._running or get_pdmix_metadata(scheduler_output).batch_type is BatchType.EMPTY:
             return
         try:
             seq = self._seq
@@ -170,7 +169,7 @@ class PPSchedulerZmqSubscriber:
                 seq_bytes, data = self._pull.recv_multipart()
                 seq = int.from_bytes(seq_bytes, "big")
                 scheduler_output = pickle.loads(data)
-                if scheduler_output.batch_type is BatchType.EMPTY:
+                if get_pdmix_metadata(scheduler_output).batch_type is BatchType.EMPTY:
                     continue
                 with self._lock:
                     self._received_outputs.append((seq, scheduler_output))

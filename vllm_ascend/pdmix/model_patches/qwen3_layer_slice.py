@@ -34,7 +34,6 @@ def _patch_qwen3_for_causal_lm(model_cls: type) -> None:
     """
     Patch Qwen3ForCausalLM with layer slicing support.
     """
-    original_forward = model_cls.forward
 
     def patched_forward(
         self,

@@ -264,6 +264,134 @@ class TestModelPatches(unittest.TestCase):
                     f"original_forward call should not contain layer_slice parameters: {call}"
                 )
 
+    def test_no_unused_original_forward_variables(self):
+        """
+        Test that patch files do NOT contain unused original_forward variables.
+        """
+        import re
+        from pathlib import Path
+
+        # Get the patch directory
+        patch_dir = REPO_ROOT / "vllm_ascend" / "pdmix" / "model_patches"
+
+        # Files to check
+        patch_files = [
+            "qwen2_layer_slice.py",
+            "qwen3_layer_slice.py",
+            "qwen3_5_layer_slice.py",
+            "qwen3_next_layer_slice.py",
+        ]
+
+        for patch_file in patch_files:
+            file_path = patch_dir / patch_file
+            self.assertTrue(file_path.exists(), f"Patch file {patch_file} not found")
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+                # Check for original_forward = ... patterns that are not used
+                # Look for assignments, then check if original_forward is used later
+                original_forward_assignments = re.finditer(
+                    r'original_forward\s*=\s*[^#\n]+',
+                    content
+                )
+
+                for match in original_forward_assignments:
+                    # Get the position of the assignment
+                    assign_pos = match.end()
+                    # Check if original_forward is used after this position
+                    content_after = content[assign_pos:]
+                    # Look for original_forward( or original_forward. or just original_forward
+                    # in a non-assignment context
+                    has_usage = (
+                        'original_forward(' in content_after or
+                        'original_forward.' in content_after or
+                        re.search(r'\boriginal_forward\b[^=]', content_after) is not None
+                    )
+
+                    self.assertFalse(
+                        has_usage is False,  # Wait, we want to ensure there are NO assignments
+                        # Actually, let's just check there are no assignments at all
+                        # since we removed all unused ones
+                    )
+
+                # Better check: just make sure there are no original_forward assignments period
+                self.assertNotIn(
+                    'original_forward =',
+                    content,
+                    f"Found unused original_forward variable in {patch_file}. "
+                    f"These should be removed."
+                )
+
+    def test_qwen_layer_loops_use_correct_islice(self):
+        """
+        Test that Qwen2 and Qwen3Next layer loops use islice(self.layers, exec_start, exec_end)
+        instead of the relative exec_start - self.start_layer pattern.
+        """
+        import re
+        from pathlib import Path
+
+        # Get the patch directory
+        patch_dir = REPO_ROOT / "vllm_ascend" / "pdmix" / "model_patches"
+
+        # Check Qwen2
+        qwen2_file = patch_dir / "qwen2_layer_slice.py"
+        self.assertTrue(qwen2_file.exists(), "qwen2_layer_slice.py not found")
+
+        with open(qwen2_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+            # Check for the correct islice pattern
+            self.assertIn(
+                'islice(self.layers, exec_start, exec_end)',
+                content,
+                "qwen2_layer_slice.py should use islice(self.layers, exec_start, exec_end)"
+            )
+
+            # Check that the old pattern is NOT present
+            self.assertNotIn(
+                'islice(self.layers, exec_start - self.start_layer',
+                content,
+                "qwen2_layer_slice.py should not use relative layer indices"
+            )
+
+            # Check that enumerate doesn't have start=exec_start
+            enumerate_matches = re.findall(r'enumerate\(', content)
+            # Qwen2 shouldn't have start=exec_start
+            self.assertNotIn(
+                'start=exec_start',
+                content,
+                "qwen2_layer_slice.py should not use start=exec_start in enumerate"
+            )
+
+        # Check Qwen3Next
+        qwen3_next_file = patch_dir / "qwen3_next_layer_slice.py"
+        self.assertTrue(qwen3_next_file.exists(), "qwen3_next_layer_slice.py not found")
+
+        with open(qwen3_next_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+            # Check for the correct islice pattern
+            self.assertIn(
+                'islice(self.layers, exec_start, exec_end)',
+                content,
+                "qwen3_next_layer_slice.py should use islice(self.layers, exec_start, exec_end)"
+            )
+
+            # Check that the old pattern is NOT present
+            self.assertNotIn(
+                'islice(self.layers, exec_start - self.start_layer',
+                content,
+                "qwen3_next_layer_slice.py should not use relative layer indices"
+            )
+
+            # Check that enumerate has start=exec_start
+            self.assertIn(
+                'start=exec_start',
+                content,
+                "qwen3_next_layer_slice.py should use start=exec_start in enumerate"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

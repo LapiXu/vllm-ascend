@@ -35,14 +35,14 @@ def apply_patch() -> None:
         Qwen3_5MoeConfig = None
         Qwen3_5MoeTextConfig = None
 
-    # Patch Qwen3_5Config if needed
+    # Patch Qwen3_5Config if needed (non-MoE, no num_experts)
     if Qwen3_5Config is not None and Qwen3_5Config not in _patched:
-        _patch_qwen_config(Qwen3_5Config)
+        _patch_qwen_config(Qwen3_5Config, add_num_experts=False)
         _patched.add(Qwen3_5Config)
 
-    # Patch Qwen3_5MoeConfig if needed
+    # Patch Qwen3_5MoeConfig if needed (MoE, with num_experts)
     if Qwen3_5MoeConfig is not None and Qwen3_5MoeConfig not in _patched:
-        _patch_qwen_config(Qwen3_5MoeConfig)
+        _patch_qwen_config(Qwen3_5MoeConfig, add_num_experts=True)
         _patched.add(Qwen3_5MoeConfig)
 
     # Patch text configs if needed
@@ -55,7 +55,7 @@ def apply_patch() -> None:
         _patched.add(Qwen3_5MoeTextConfig)
 
 
-def _patch_qwen_config(config_cls: type) -> None:
+def _patch_qwen_config(config_cls: type, add_num_experts: bool = False) -> None:
     """
     Patch Qwen multimodal config class with necessary property delegations.
     Only keeps essential properties as specified in requirements:
@@ -65,7 +65,7 @@ def _patch_qwen_config(config_cls: type) -> None:
     - hidden_size
     - vocab_size
     - layer_types
-    - num_experts (for MoE)
+    - num_experts (for MoE only)
     """
     # Essential properties to delegate
     properties_to_add = [
@@ -75,8 +75,11 @@ def _patch_qwen_config(config_cls: type) -> None:
         ("hidden_size", "hidden_size"),
         ("vocab_size", "vocab_size"),
         ("layer_types", "layer_types"),
-        ("num_experts", "num_experts"),
     ]
+
+    # Add num_experts only for MoE configs
+    if add_num_experts:
+        properties_to_add.append(("num_experts", "num_experts"))
 
     for prop_name, attr_name in properties_to_add:
         if not hasattr(config_cls, prop_name):

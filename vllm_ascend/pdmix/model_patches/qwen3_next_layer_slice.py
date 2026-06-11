@@ -44,7 +44,6 @@ def _patch_qwen3_next_model(model_cls: type, IntermediateTensors: type, get_pp_g
     """
     Patch Qwen3NextModel with layer slicing support.
     """
-    original_forward = model_cls.forward
 
     def patched_forward(
         self,
@@ -85,7 +84,7 @@ def _patch_qwen3_next_model(model_cls: type, IntermediateTensors: type, get_pp_g
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
-            islice(self.layers, exec_start - self.start_layer, exec_end - self.start_layer),
+            islice(self.layers, exec_start, exec_end),
             start=exec_start,
         ):
             hidden_states, residual = layer(
@@ -141,7 +140,6 @@ def _patch_qwen3_next_for_causal_lm(model_cls: type) -> None:
     """
     Patch Qwen3NextForCausalLM with layer slicing support.
     """
-    original_forward = model_cls.forward
 
     def patched_forward(
         self,

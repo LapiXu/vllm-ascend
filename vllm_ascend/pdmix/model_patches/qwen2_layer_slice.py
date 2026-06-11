@@ -39,7 +39,6 @@ def _patch_qwen2_model(model_cls: type, IntermediateTensors: type, get_pp_group,
     """
     Patch Qwen2Model with layer slicing support.
     """
-    original_forward = model_cls.forward
 
     def patched_forward(
         self,
@@ -80,7 +79,7 @@ def _patch_qwen2_model(model_cls: type, IntermediateTensors: type, get_pp_group,
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for idx, layer in enumerate(
-            islice(self.layers, exec_start - self.start_layer, exec_end - self.start_layer)
+            islice(self.layers, exec_start, exec_end)
         ):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
@@ -133,7 +132,6 @@ def _patch_qwen2_for_causal_lm(model_cls: type) -> None:
     """
     Patch Qwen2ForCausalLM with layer slicing support.
     """
-    original_forward = model_cls.forward
 
     def patched_forward(
         self,

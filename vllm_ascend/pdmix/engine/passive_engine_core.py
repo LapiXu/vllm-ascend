@@ -6,6 +6,7 @@ import time
 from typing import TYPE_CHECKING
 
 import vllm_ascend.envs as envs
+from vllm import envs as vllm_envs
 from vllm.logger import init_logger
 from vllm.utils import set_process_title
 from vllm.transformers_utils.config import (
@@ -178,8 +179,8 @@ class PassiveEngineCoreProc:
         # Mark this process as a non-leader PP rank running with passive
         # EngineCore, so that MultiprocExecutor and WorkerProc set up dual
         # message queues (local + cross-node).
-        os.environ["VLLM_PP_NON_LEADER_ENGINE_CORE"] = "1"
-        envs.disable_envs_cache()
+        os.environ["VLLM_ASCEND_PDMIX_NON_LEADER_ENGINE_CORE"] = "1"
+        vllm_envs.disable_envs_cache()
 
         set_process_title("PassiveEngineCore")
         # TODO: Add tracing initialization if needed
@@ -190,9 +191,9 @@ class PassiveEngineCoreProc:
         # decorate_logs()
 
         pp_subscriber: PPSchedulerZmqSubscriber | None = None
-        if envs.VLLM_PP_SCHEDULER_ZMQ_ADDR is not None:
+        if envs.VLLM_ASCEND_PDMIX_SCHEDULER_ZMQ_ADDR is not None:
             pp_subscriber = PPSchedulerZmqSubscriber(
-                envs.VLLM_PP_SCHEDULER_ZMQ_ADDR
+                envs.VLLM_ASCEND_PDMIX_SCHEDULER_ZMQ_ADDR
             )
 
         # Cloud-side PD-separation channel is constructed inside the try
@@ -226,12 +227,12 @@ class PassiveEngineCoreProc:
                     DispatchPolicy,
                 )
                 try:
-                    policy = DispatchPolicy(envs.VLLM_PP_PASSIVE_DISPATCH_POLICY)
+                    policy = DispatchPolicy(envs.VLLM_ASCEND_PDMIX_PASSIVE_DISPATCH_POLICY)
                 except ValueError:
                     logger.warning(
-                        "Unknown VLLM_PP_PASSIVE_DISPATCH_POLICY=%r; "
+                        "Unknown VLLM_ASCEND_PDMIX_PASSIVE_DISPATCH_POLICY=%r; "
                         "falling back to expect_alternation.",
-                        envs.VLLM_PP_PASSIVE_DISPATCH_POLICY,
+                        envs.VLLM_ASCEND_PDMIX_PASSIVE_DISPATCH_POLICY,
                     )
                     policy = DispatchPolicy.EXPECT_ALTERNATION
 
@@ -241,11 +242,11 @@ class PassiveEngineCoreProc:
                 if vllm_config.parallel_config.enable_pd_separation:
                     master_addr = vllm_config.parallel_config.master_addr
                     post_out_bind = (
-                        f"tcp://*:{envs.VLLM_PP_POST_OUT_ZMQ_PORT}"
+                        f"tcp://*:{envs.VLLM_ASCEND_PDMIX_POST_OUT_ZMQ_PORT}"
                     )
                     pre_out_connect = (
                         f"tcp://{master_addr}:"
-                        f"{envs.VLLM_PP_PRE_OUT_ZMQ_PORT}"
+                        f"{envs.VLLM_ASCEND_PDMIX_PRE_OUT_ZMQ_PORT}"
                     )
                     pp_pd_channel = PPSchedulerZmqChannel(
                         send_endpoint=post_out_bind,

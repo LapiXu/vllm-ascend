@@ -12,8 +12,7 @@ _patched: Set[type] = set()
 def apply_patch() -> None:
     """
     Apply compatibility patches for Qwen model configurations.
-    This ensures that Qwen3.5/Qwen3.5-MoE config classes have necessary
-    attribute delegations.
+    This function is idempotent - it can be called multiple times safely.
     """
     # Try to import config classes
     try:
@@ -58,26 +57,25 @@ def apply_patch() -> None:
 
 def _patch_qwen_config(config_cls: type) -> None:
     """
-    Patch Qwen multimodal config class with additional property delegations.
+    Patch Qwen multimodal config class with necessary property delegations.
+    Only keeps essential properties as specified in requirements:
+    - num_hidden_layers
+    - num_attention_heads
+    - num_key_value_heads
+    - hidden_size
+    - vocab_size
+    - layer_types
+    - num_experts (for MoE)
     """
-    # Check and add properties that might be missing
+    # Essential properties to delegate
     properties_to_add = [
-        ("intermediate_size", "intermediate_size"),
-        ("rms_norm_eps", "rms_norm_eps"),
-        ("head_dim", "head_dim"),
-        ("max_position_embeddings", "max_position_embeddings"),
-        ("hidden_act", "hidden_act"),
-        ("rope_parameters", "rope_parameters"),
-        ("moe_intermediate_size", "moe_intermediate_size"),
-        ("shared_expert_intermediate_size", "shared_expert_intermediate_size"),
-        ("num_experts_per_tok", "num_experts_per_tok"),
+        ("num_hidden_layers", "num_hidden_layers"),
+        ("num_attention_heads", "num_attention_heads"),
+        ("num_key_value_heads", "num_key_value_heads"),
+        ("hidden_size", "hidden_size"),
+        ("vocab_size", "vocab_size"),
+        ("layer_types", "layer_types"),
         ("num_experts", "num_experts"),
-        ("intermediate_size", "intermediate_size"),
-        ("linear_conv_kernel_dim", "linear_conv_kernel_dim"),
-        ("linear_key_head_dim", "linear_key_head_dim"),
-        ("linear_value_head_dim", "linear_value_head_dim"),
-        ("linear_num_key_heads", "linear_num_key_heads"),
-        ("linear_num_value_heads", "linear_num_value_heads"),
     ]
 
     for prop_name, attr_name in properties_to_add:
@@ -88,8 +86,8 @@ def _patch_qwen_config(config_cls: type) -> None:
 def _patch_qwen_text_config(config_cls: type) -> None:
     """
     Patch Qwen text config class with any necessary compatibility fixes.
+    Currently just a placeholder for potential future text config patches.
     """
-    # Currently just a placeholder for potential future text config patches
     pass
 
 

@@ -47,3 +47,12 @@ def test_metadata_can_be_attached_without_modifying_vllm_class_definition():
     assert getattr(output, "batch_type") == BatchType.PREFILL_FIRST
     assert getattr(output, "head_token") == "head-1"
     assert getattr(output, "hidden_channel") == HiddenChannelType.PREFILL_1
+
+
+def test_get_pdmix_metadata_returns_defaults_when_not_set():
+    output = DummySchedulerOutput()
+    metadata = get_pdmix_metadata(output)
+
+    assert metadata.batch_type == BatchType.PD_MIX
+    assert metadata.head_token is None
+    assert metadata.hidden_channel is None

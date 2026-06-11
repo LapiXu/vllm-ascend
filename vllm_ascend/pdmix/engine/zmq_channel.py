@@ -26,13 +26,7 @@ import threading
 import time
 from typing import Optional, TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import zmq
-else:
-    try:
-        import zmq
-    except ImportError:
-        zmq = None
+import zmq
 
 from vllm_ascend.pdmix.sched.output import BatchType, get_pdmix_metadata
 from vllm.logger import init_logger
@@ -54,11 +48,6 @@ class PPSchedulerZmqPublisher:
     SHUTDOWN_TIMEOUT: float = 2.0
 
     def __init__(self, endpoint: str) -> None:
-        if zmq is None:
-            raise ImportError(
-                "zmq is required for PPSchedulerZmqPublisher. "
-                "Please install it with `pip install pyzmq`."
-            )
         self._endpoint = endpoint
         self._queue: queue.Queue[
             tuple[int, object] | None
@@ -151,11 +140,6 @@ class PPSchedulerZmqSubscriber:
     SHUTDOWN_TIMEOUT: float = 2.0
 
     def __init__(self, endpoint: str) -> None:
-        if zmq is None:
-            raise ImportError(
-                "zmq is required for PPSchedulerZmqSubscriber. "
-                "Please install it with `pip install pyzmq`."
-            )
         self._endpoint = endpoint
         self._running = True
         self._received_outputs: list[tuple[int, object]] = []

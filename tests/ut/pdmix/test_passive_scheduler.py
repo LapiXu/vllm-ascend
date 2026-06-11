@@ -247,21 +247,12 @@ def test_prefill_first_sliced_like_pure_prefill():
     assert scheduler._total_slices == 2
     sub.feed(_make_so(BatchType.PREFILL_FIRST))
     scheduler.poll_and_classify()
-    batch = scheduler.schedule()
-    assert batch.scheduler_output.batch_type == BatchType.PREFILL_FIRST
-    assert len(batch.slices) == 2
-    assert all(isinstance(info, LayerSliceInfo) for info in batch.slices)
 
-
-def test_pure_prefill_sliced_into_n_slices():
-    scheduler, sub = _make_scheduler(layer_slice_size=2, num_hidden_layers=8)
-    assert scheduler._total_slices == 2
-    sub.feed(_make_so(BatchType.PURE_PREFILL))
-    scheduler.poll_and_classify()
-    batch = scheduler.schedule()
-    assert batch.scheduler_output.batch_type == BatchType.PURE_PREFILL
-    assert len(batch.slices) == 2
-    info0, info1 = batch.slices
+    # First call returns first slice
+    batch1 = scheduler.schedule()
+    assert batch1.scheduler_output.batch_type == BatchType.PREFILL_FIRST
+    assert len(batch1.slices) == 1
+    info0 = batch1.slices[0]
     assert isinstance(info0, LayerSliceInfo)
     assert info0.slice_index == 0
     assert info0.total_slices == 2
@@ -269,20 +260,80 @@ def test_pure_prefill_sliced_into_n_slices():
     assert info0.end_layer == 2
     assert info0.is_first_slice is True
     assert info0.is_last_slice is False
+
+    # Second call returns second slice
+    batch2 = scheduler.schedule()
+    assert batch2.scheduler_output.batch_type == BatchType.PREFILL_FIRST
+    assert len(batch2.slices) == 1
+    info1 = batch2.slices[0]
+    assert isinstance(info1, LayerSliceInfo)
     assert info1.slice_index == 1
+    assert info1.total_slices == 2
     assert info1.start_layer == 2
     assert info1.end_layer == 4
     assert info1.is_first_slice is False
     assert info1.is_last_slice is True
+
+    # Third call returns empty
+    batch3 = scheduler.schedule()
+    assert batch3.is_empty()
+
+
+def test_pure_prefill_sliced_into_n_slices():
+    scheduler, sub = _make_scheduler(layer_slice_size=2, num_hidden_layers=8)
+    assert scheduler._total_slices == 2
+    sub.feed(_make_so(BatchType.PURE_PREFILL))
+    scheduler.poll_and_classify()
+
+    # First call returns first slice
+    batch1 = scheduler.schedule()
+    assert batch1.scheduler_output.batch_type == BatchType.PURE_PREFILL
+    assert len(batch1.slices) == 1
+    info0 = batch1.slices[0]
+    assert isinstance(info0, LayerSliceInfo)
+    assert info0.slice_index == 0
+    assert info0.total_slices == 2
+    assert info0.start_layer == 0
+    assert info0.end_layer == 2
+    assert info0.is_first_slice is True
+    assert info0.is_last_slice is False
+
+    # Second call returns second slice
+    batch2 = scheduler.schedule()
+    assert batch2.scheduler_output.batch_type == BatchType.PURE_PREFILL
+    assert len(batch2.slices) == 1
+    info1 = batch2.slices[0]
+    assert isinstance(info1, LayerSliceInfo)
+    assert info1.slice_index == 1
+    assert info1.total_slices == 2
+    assert info1.start_layer == 2
+    assert info1.end_layer == 4
+    assert info1.is_first_slice is False
+    assert info1.is_last_slice is True
+
+    # Third call returns empty
+    batch3 = scheduler.schedule()
+    assert batch3.is_empty()
 
 
 def test_pdmix_sliced_like_pure_prefill():
     scheduler, sub = _make_scheduler(layer_slice_size=2, num_hidden_layers=8)
     sub.feed(_make_so(BatchType.PD_MIX))
     scheduler.poll_and_classify()
-    batch = scheduler.schedule()
-    assert len(batch.slices) == 2
-    assert all(isinstance(info, LayerSliceInfo) for info in batch.slices)
+
+    # First call returns first slice
+    batch1 = scheduler.schedule()
+    assert len(batch1.slices) == 1
+    assert isinstance(batch1.slices[0], LayerSliceInfo)
+
+    # Second call returns second slice
+    batch2 = scheduler.schedule()
+    assert len(batch2.slices) == 1
+    assert isinstance(batch2.slices[0], LayerSliceInfo)
+
+    # Third call returns empty
+    batch3 = scheduler.schedule()
+    assert batch3.is_empty()
 
 
 def test_no_slicing_when_disabled():
@@ -310,12 +361,30 @@ def test_uneven_slice_tail_is_clamped():
     assert scheduler._total_slices == 2
     sub.feed(_make_so(BatchType.PURE_PREFILL))
     scheduler.poll_and_classify()
-    batch = scheduler.schedule()
-    assert len(batch.slices) == 2
-    info1 = batch.slices[1]
+
+    # First call returns first slice
+    batch1 = scheduler.schedule()
+    assert len(batch1.slices) == 1
+    info0 = batch1.slices[0]
+    assert isinstance(info0, LayerSliceInfo)
+    assert info0.start_layer == 0
+    assert info0.end_layer == 3
+    assert info0.is_first_slice is True
+    assert info0.is_last_slice is False
+
+    # Second call returns second (tail) slice
+    batch2 = scheduler.schedule()
+    assert len(batch2.slices) == 1
+    info1 = batch2.slices[0]
+    assert isinstance(info1, LayerSliceInfo)
     assert info1.start_layer == 3
     assert info1.end_layer == 4
+    assert info1.is_first_slice is False
     assert info1.is_last_slice is True
+
+    # Third call returns empty
+    batch3 = scheduler.schedule()
+    assert batch3.is_empty()
 
 
 # ---------------------------------------------------------------------- #

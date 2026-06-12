@@ -69,7 +69,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm_ascend.pdmix.sched.output import BatchType
+from vllm_ascend.pdmix.sched.output import BatchType, get_pdmix_metadata
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -1942,7 +1942,7 @@ class NPUModelRunner(GPUModelRunner):
         if (
             self._edge_cloud_enabled
             and is_edge_device()
-            and scheduler_output.batch_type in (
+            and get_pdmix_metadata(scheduler_output).batch_type in (
                 BatchType.PREFILL_LAST, BatchType.DECODE_LAST
             )
             and intermediate_tensors is not None
@@ -2016,7 +2016,7 @@ class NPUModelRunner(GPUModelRunner):
                 is_edge_tail_segment = (
                     self._edge_cloud_enabled
                     and is_edge_device()
-                    and scheduler_output.batch_type in (
+                    and get_pdmix_metadata(scheduler_output).batch_type in (
                         BatchType.PREFILL_LAST,
                         BatchType.DECODE_LAST,
                     )
@@ -3208,7 +3208,7 @@ class NPUModelRunner(GPUModelRunner):
         Called just before the edge head-segment returns IntermediateTensors
         to the worker for cross-node transmission.
         """
-        token = scheduler_output.head_token
+        token = get_pdmix_metadata(scheduler_output).head_token
         if not token:
             return
         if token in self._pending_head_states:
@@ -3233,7 +3233,7 @@ class NPUModelRunner(GPUModelRunner):
         cloud worker echoes it back inside the intermediate tensors payload
         (data plane).  Both must match before we execute the tail segment.
         """
-        token_ctrl = scheduler_output.head_token
+        token_ctrl = get_pdmix_metadata(scheduler_output).head_token
         if not token_ctrl:
             raise RuntimeError(
                 "PL/DL scheduler_output must carry head_token from cloud"
@@ -3261,13 +3261,13 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         expected = self._expected_tail_batch_type(
-            head_state.scheduler_output.batch_type
+            get_pdmix_metadata(head_state.scheduler_output).batch_type
         )
-        if scheduler_output.batch_type != expected:
+        if get_pdmix_metadata(scheduler_output).batch_type != expected:
             raise RuntimeError(
                 f"HeadState batch_type mismatch: head was "
-                f"{head_state.scheduler_output.batch_type}, "
-                f"tail is {scheduler_output.batch_type}"
+                f"{get_pdmix_metadata(head_state.scheduler_output).batch_type}, "
+                f"tail is {get_pdmix_metadata(scheduler_output).batch_type}"
             )
 
         tail_req_ids = tuple(scheduler_output.num_scheduled_tokens)

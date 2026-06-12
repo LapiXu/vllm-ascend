@@ -123,14 +123,28 @@ class PassiveEngineCoreProc:
         if self._pp_pd_channel is None:
             return
         from dataclasses import replace
-        from vllm_ascend.pdmix.sched.output import BatchType
-        bt = scheduler_output.batch_type
-        if bt == BatchType.PREFILL_FIRST:
-            tail = replace(scheduler_output, batch_type=BatchType.PREFILL_LAST)
-        elif bt == BatchType.DECODE_FIRST:
-            tail = replace(scheduler_output, batch_type=BatchType.DECODE_LAST)
+        from vllm_ascend.pdmix.sched.output import (
+            BatchType,
+            PDMixSchedulerMetadata,
+            get_pdmix_metadata,
+            set_pdmix_metadata,
+        )
+        metadata = get_pdmix_metadata(scheduler_output)
+        if metadata.batch_type == BatchType.PREFILL_FIRST:
+            tail_batch_type = BatchType.PREFILL_LAST
+        elif metadata.batch_type == BatchType.DECODE_FIRST:
+            tail_batch_type = BatchType.DECODE_LAST
         else:
             return
+        tail = replace(scheduler_output)
+        set_pdmix_metadata(
+            tail,
+            PDMixSchedulerMetadata(
+                batch_type=tail_batch_type,
+                head_token=metadata.head_token,
+                hidden_channel=metadata.hidden_channel,
+            ),
+        )
         # Echo the head_token back so the edge can correlate the tail
         # segment with its suspended head state.
         self._pp_pd_channel.publish(tail)

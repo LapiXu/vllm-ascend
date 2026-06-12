@@ -49,7 +49,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import SchedulerOutput, GrammarOutput
-from vllm_ascend.pdmix.sched.output import BatchType, HiddenChannelType
+from vllm_ascend.pdmix.sched.output import BatchType, HiddenChannelType, get_pdmix_metadata
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
@@ -528,7 +528,7 @@ class NPUWorker(WorkerBase):
         # channel.  Only wait on the channel about to be reused; legacy PP waits
         # for all outstanding sends to preserve the original behavior.
         if self.model_runner._edge_cloud_enabled:
-            bt = scheduler_output.batch_type
+            bt = get_pdmix_metadata(scheduler_output).batch_type
             if bt in (
                 BatchType.PREFILL_FIRST,
                 BatchType.DECODE_FIRST,
@@ -543,7 +543,7 @@ class NPUWorker(WorkerBase):
 
         # Edge-cloud PD-separation: dispatch by batch_type and role.
         if self.model_runner._edge_cloud_enabled:
-            bt = scheduler_output.batch_type
+            bt = get_pdmix_metadata(scheduler_output).batch_type
             if is_cloud_device():
                 return self._execute_model_cloud(
                     scheduler_output, layer_slice_info
@@ -563,10 +563,11 @@ class NPUWorker(WorkerBase):
         )
 
     def _hidden_channel_for(self, scheduler_output: "SchedulerOutput") -> HiddenChannelType:
-        channel = scheduler_output.hidden_channel
+        metadata = get_pdmix_metadata(scheduler_output)
+        channel = metadata.hidden_channel
         if channel is not None:
             return channel
-        bt = scheduler_output.batch_type
+        bt = metadata.batch_type
         if bt in (BatchType.PREFILL_FIRST, BatchType.PREFILL_LAST):
             return HiddenChannelType.PREFILL_1
         if bt in (BatchType.DECODE_FIRST, BatchType.DECODE_LAST):
@@ -703,7 +704,7 @@ class NPUWorker(WorkerBase):
         assert isinstance(output, IntermediateTensors)
         # Echo the head_token back to the edge so the tail segment can
         # correlate the data-plane tensor with the control-plane scheduler output.
-        token = scheduler_output.head_token
+        token = get_pdmix_metadata(scheduler_output).head_token
         if token:
             output.tensors["_head_token"] = torch.tensor(
                 list(bytearray(token, "utf-8")),

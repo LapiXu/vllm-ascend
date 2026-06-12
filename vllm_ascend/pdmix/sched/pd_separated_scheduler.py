@@ -12,8 +12,9 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm_ascend.pdmix.sched.output import (
     BatchType,
     HiddenChannelType,
-    set_pdmix_metadata,
     PDMixSchedulerMetadata,
+    get_pdmix_metadata,
+    set_pdmix_metadata,
 )
 
 logger = init_logger(__name__)
@@ -165,7 +166,7 @@ class PDSeparatedScheduler:
         state = self._prefill_state()
         scheduler_output = self._pick_by_state(state)
         has_work = scheduler_output.total_num_scheduled_tokens > 0
-        is_tail = scheduler_output.batch_type in (
+        is_tail = get_pdmix_metadata(scheduler_output).batch_type in (
             BatchType.PREFILL_LAST,
             BatchType.DECODE_LAST,
         )
@@ -312,8 +313,8 @@ class PDSeparatedScheduler:
         if not self.prefills_last_ready:
             return self._make_empty_batch()
         so = self.prefills_last_ready.popleft()
-        assert so.batch_type == BatchType.PREFILL_LAST, (
-            f"prefills_last_ready expects PREFILL_LAST, got {so.batch_type}"
+        assert get_pdmix_metadata(so).batch_type == BatchType.PREFILL_LAST, (
+            f"prefills_last_ready expects PREFILL_LAST, got {get_pdmix_metadata(so).batch_type}"
         )
         # Drop these reqs from chunk_prefill_first. Keep them in
         # prefill_last_pending until update_from_output() moves them to running.
@@ -328,13 +329,13 @@ class PDSeparatedScheduler:
             f"[PD] _pick_prefill_last_batch popped {len(last_req_ids)} reqs; "
             f"remaining prefills_last_ready[]: {len(self.prefills_last_ready)}, "
             f"prefill_last_pending[]: {len(self.prefill_last_pending)}, "
-            f"hidden_channel: {so.hidden_channel}"
+            f"hidden_channel: {get_pdmix_metadata(so).hidden_channel}"
         )
         return so
 
     def _validate_prefill_tail_channel(self, scheduler_output: SchedulerOutput) -> None:
-        token = scheduler_output.head_token
-        channel = scheduler_output.hidden_channel
+        token = get_pdmix_metadata(scheduler_output).head_token
+        channel = get_pdmix_metadata(scheduler_output).hidden_channel
         if not token:
             raise RuntimeError("PREFILL_LAST missing head_token")
         if channel not in (HiddenChannelType.PREFILL_1, HiddenChannelType.PREFILL_2):
@@ -349,18 +350,18 @@ class PDSeparatedScheduler:
             )
 
     def _validate_decode_tail_channel(self, scheduler_output: SchedulerOutput) -> None:
-        if scheduler_output.hidden_channel != HiddenChannelType.DECODE:
+        if get_pdmix_metadata(scheduler_output).hidden_channel != HiddenChannelType.DECODE:
             raise RuntimeError(
                 "DECODE_LAST expects decode hidden channel, got "
-                f"{scheduler_output.hidden_channel}"
+                f"{get_pdmix_metadata(scheduler_output).hidden_channel}"
             )
 
     def _pick_decode_last_batch(self) -> SchedulerOutput:
         if not self.decodes_last_ready:
             return self._make_empty_batch()
         so = self.decodes_last_ready.popleft()
-        assert so.batch_type == BatchType.DECODE_LAST, (
-            f"decodes_last_ready expects DECODE_LAST, got {so.batch_type}"
+        assert get_pdmix_metadata(so).batch_type == BatchType.DECODE_LAST, (
+            f"decodes_last_ready expects DECODE_LAST, got {get_pdmix_metadata(so).batch_type}"
         )
         self._validate_decode_tail_channel(so)
         print(
@@ -501,12 +502,13 @@ class PDSeparatedScheduler:
         scheduler_output: SchedulerOutput,
         model_runner_output: Any,
     ) -> dict[int, Any]:
-        if scheduler_output.batch_type == BatchType.PREFILL_LAST:
+        if get_pdmix_metadata(scheduler_output).batch_type == BatchType.PREFILL_LAST:
             if self.prefill_inflight_count > 0:
                 self.prefill_inflight_count -= 1
-            if scheduler_output.head_token:
+            metadata = get_pdmix_metadata(scheduler_output)
+            if metadata.head_token:
                 self.hidden_channel_manager.release_prefill(
-                    scheduler_output.head_token
+                    metadata.head_token
                 )
             # Move completed requests from prefill_last_pending to running.
             completed_req_ids = set(scheduler_output.num_scheduled_tokens.keys())
@@ -524,7 +526,7 @@ class PDSeparatedScheduler:
                 f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
                 f"moved {len(newly_running)} reqs to running[], running[]: {len(self.running)}"
             )
-        if scheduler_output.batch_type == BatchType.DECODE_LAST:
+        if get_pdmix_metadata(scheduler_output).batch_type == BatchType.DECODE_LAST:
             if self.decode_inflight_count > 0:
                 self.decode_inflight_count -= 1
             print(

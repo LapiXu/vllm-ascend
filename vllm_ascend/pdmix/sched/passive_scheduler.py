@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, NamedTuple
 from vllm_ascend import envs as envs_ascend
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm_ascend.pdmix.sched.output import BatchType
+from vllm_ascend.pdmix.sched.output import BatchType, get_pdmix_metadata
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -240,7 +240,7 @@ class PassiveScheduler:
                     break
                 print("poll_and_classify: inbox is empty", flush=True)
                 scheduler_output = self._inbox.get(block=True)
-            bt = scheduler_output.batch_type
+            bt = get_pdmix_metadata(scheduler_output).batch_type
             print(f"Received scheduler_output from edge, batch_type: {bt}", flush=True)
             if bt == BatchType.EMPTY:
                 continue
@@ -303,7 +303,7 @@ class PassiveScheduler:
         # Decode-like and empty batches are never sliced. DECODE_FIRST is the
         # edge-cloud head segment of a decode step — same per-token shape as
         # PURE_DECODE, so it follows the same no-slice rule.
-        if so.batch_type in (
+        if get_pdmix_metadata(so).batch_type in (
             BatchType.PURE_DECODE,
             BatchType.DECODE_FIRST,
         ):
@@ -428,7 +428,9 @@ class PassiveScheduler:
             "pending=(prefills=%d, active_prefill_slices=%d, "
             "pdmixes=%d, decodes=%d)",
             self.dispatch_policy.value,
-            so.batch_type.value if so.batch_type is not None else "<none>",
+            get_pdmix_metadata(so).batch_type.value
+            if get_pdmix_metadata(so).batch_type is not None
+            else "<none>",
             len(batch.slices),
             len(self.ready_prefills),
             len(self._active_prefill_slices),

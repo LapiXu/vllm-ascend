@@ -132,7 +132,7 @@ def _make_proc(
     )
 
     # Create a custom scheduler that doesn't need real ZMQ
-    with patch("vllm_ascend.envs.VLLM_LAYER_SLICE_SIZE", layer_slice_size):
+    with patch("vllm_ascend.envs.VLLM_ASCEND_PDMIX_LAYER_SLICE_SIZE", layer_slice_size):
         scheduler = PassiveScheduler(
             cfg, sub,
             dispatch_policy=dispatch_policy,

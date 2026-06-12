@@ -238,10 +238,10 @@ class PassiveScheduler:
             except queue.Empty:
                 if has_ready_work:
                     break
-                logger.debug("poll_and_classify: inbox is empty")
+                print("poll_and_classify: inbox is empty", flush=True)
                 scheduler_output = self._inbox.get(block=True)
             bt = scheduler_output.batch_type
-            logger.debug(f"Received scheduler_output from edge, batch_type: {bt}")
+            print(f"Received scheduler_output from edge, batch_type: {bt}", flush=True)
             if bt == BatchType.EMPTY:
                 continue
             elif bt in (BatchType.PURE_PREFILL, BatchType.PREFILL_FIRST):

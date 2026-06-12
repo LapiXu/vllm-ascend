@@ -329,7 +329,7 @@ class PDSeparatedScheduler:
             f"[PD] _pick_prefill_last_batch popped {len(last_req_ids)} reqs; "
             f"remaining prefills_last_ready[]: {len(self.prefills_last_ready)}, "
             f"prefill_last_pending[]: {len(self.prefill_last_pending)}, "
-            f"hidden_channel: {get_pdmix_metadata(so).hidden_channel}"
+            f"hidden_channel: {so.hidden_channel}"
         )
         return so
 
@@ -505,10 +505,9 @@ class PDSeparatedScheduler:
         if get_pdmix_metadata(scheduler_output).batch_type == BatchType.PREFILL_LAST:
             if self.prefill_inflight_count > 0:
                 self.prefill_inflight_count -= 1
-            metadata = get_pdmix_metadata(scheduler_output)
-            if metadata.head_token:
+            if get_pdmix_metadata(scheduler_output).head_token:
                 self.hidden_channel_manager.release_prefill(
-                    metadata.head_token
+                    get_pdmix_metadata(scheduler_output).head_token
                 )
             # Move completed requests from prefill_last_pending to running.
             completed_req_ids = set(scheduler_output.num_scheduled_tokens.keys())

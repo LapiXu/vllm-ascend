@@ -47,12 +47,12 @@ def apply_engine_args_patch() -> None:
 
     from vllm.engine.arg_utils import EngineArgs
 
-    original_from_cli_args = EngineArgs.from_cli_args
+    original_from_cli_args = EngineArgs.from_cli_args.__func__
     original_create_engine_config = EngineArgs.create_engine_config
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
-        engine_args = original_from_cli_args(args)
+        engine_args = original_from_cli_args(cls, args)
         for name in (
             "cloud_addr",
             "enable_pd_separation",

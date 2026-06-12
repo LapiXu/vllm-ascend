@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from argparse import ArgumentParser
+from pathlib import Path
 from unittest.mock import patch
 
 from vllm_ascend.platform import NPUPlatform
@@ -48,3 +49,13 @@ def test_pdmix_common_misspellings_are_accepted_for_compatibility():
 
     assert args.enable_pd_separation is True
     assert args.pd_prefill_inflight_limit == 2
+
+
+def test_engine_args_patch_preserves_subclass_from_cli_args():
+    repo_root = Path(__file__).resolve().parents[3]
+    source = (repo_root / "vllm_ascend" / "pdmix" / "engine" / "cli_compat.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "EngineArgs.from_cli_args.__func__" in source
+    assert "original_from_cli_args(cls, args)" in source

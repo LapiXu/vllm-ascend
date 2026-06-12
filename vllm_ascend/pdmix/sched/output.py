@@ -1,25 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import enum
 from dataclasses import dataclass
 from typing import Any
 
-
-class HiddenChannelType(enum.Enum):
-    PREFILL_1 = "PREFILL_1"
-    PREFILL_2 = "PREFILL_2"
-    DECODE = "DECODE"
-
-
-class BatchType(enum.Enum):
-    PD_MIX = "PD_MIX"
-    PURE_PREFILL = "PURE_PREFILL"
-    PURE_DECODE = "PURE_DECODE"
-    EMPTY = "EMPTY"
-    PREFILL_FIRST = "PREFILL_FIRST"
-    PREFILL_LAST = "PREFILL_LAST"
-    DECODE_FIRST = "DECODE_FIRST"
-    DECODE_LAST = "DECODE_LAST"
+from vllm.v1.core.sched.output import BatchType, HiddenChannelType
 
 
 @dataclass(frozen=True)

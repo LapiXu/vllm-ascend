@@ -8,5 +8,7 @@ def apply_engine_patches(*, is_global_patch: bool) -> None:
     # This module is kept as a centralized registration point for future PDMix engine
     # patches that cannot be expressed through platform hooks.
     if is_global_patch:
-        return None
+        from vllm_ascend.pdmix.engine.cli_compat import apply_engine_args_patch
+
+        apply_engine_args_patch()
     return None

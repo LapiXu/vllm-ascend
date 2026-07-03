@@ -2563,7 +2563,7 @@ class NPUModelRunner(GPUModelRunner):
         # === 临时调试：打印本 step 采样出的 raw token id ===
         # async scheduling 下 valid_sampled_token_ids 恒为 []，真实 token 在
         # sampler_output.sampled_token_ids（device tensor），.tolist() 会强制同步。
-        logger.info(
+        logger.debug(
             "SAMPLED req_ids=%s sampled_token_ids=%s valid_sampled_token_ids=%s",
             req_ids_output_copy,
             sampler_output.sampled_token_ids.tolist(),

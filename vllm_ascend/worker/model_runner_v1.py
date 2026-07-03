@@ -2495,6 +2495,27 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to(self.device).to(logits_dtype)
 
         with record_function_or_nullcontext("sample_token"):
+            # === 临时调试：检查 logits 是否异常（NaN / 全相等 → argmax 恒为 0）===
+            try:
+                _lg = logits.float()
+                _amax = _lg.argmax(dim=-1).tolist()
+                logger.info(
+                    "LOGITS shape=%s dtype=%s has_nan=%s has_inf=%s min=%.4f max=%.4f "
+                    "std=%.6f argmax=%s top1_val=%s val_at_0=%s",
+                    tuple(logits.shape),
+                    logits.dtype,
+                    bool(torch.isnan(_lg).any().item()),
+                    bool(torch.isinf(_lg).any().item()),
+                    _lg.min().item(),
+                    _lg.max().item(),
+                    _lg.std().item(),
+                    _amax,
+                    _lg.max(dim=-1).values.tolist(),
+                    _lg[:, 0].tolist(),
+                )
+            except Exception as _e:  # noqa
+                logger.info("LOGITS debug failed: %s", _e)
+            # ============================================================
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self.need_accepted_tokens:

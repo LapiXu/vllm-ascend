@@ -3315,6 +3315,22 @@ class NPUModelRunner(GPUModelRunner):
         if _EXTRA_CTX.layer_idx is not None:
             _EXTRA_CTX.layer_idx = self.num_layers - self.tail_k
 
+        # === 临时调试：检查从 Cloud 接收到的 intermediate_tensors 是否含 NaN ===
+        try:
+            if isinstance(intermediate_tensors, IntermediateTensors):
+                for _k, _v in intermediate_tensors.tensors.items():
+                    _vf = _v.float()
+                    logger.info(
+                        "EDGE-RECV from cloud key=%s shape=%s has_nan=%s has_inf=%s absmax=%.4f",
+                        _k, tuple(_v.shape),
+                        bool(torch.isnan(_vf).any().item()),
+                        bool(torch.isinf(_vf).any().item()),
+                        _vf.abs().max().item(),
+                    )
+        except Exception as _e:  # noqa
+            logger.info("EDGE-RECV debug failed: %s", _e)
+        # ============================================================
+
         try:
             tail_layer_indices = list(range(
                 self.num_layers - self.tail_k,
@@ -3338,6 +3354,20 @@ class NPUModelRunner(GPUModelRunner):
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
+        # === 临时调试：检查 tail 段（segment_e）输出是否含 NaN ===
+        try:
+            if isinstance(hidden_states, torch.Tensor):
+                _hf = hidden_states.float()
+                logger.info(
+                    "EDGE-SEGE-OUT shape=%s has_nan=%s has_inf=%s absmax=%.4f",
+                    tuple(hidden_states.shape),
+                    bool(torch.isnan(_hf).any().item()),
+                    bool(torch.isinf(_hf).any().item()),
+                    _hf.abs().max().item(),
+                )
+        except Exception as _e:  # noqa
+            logger.info("EDGE-SEGE-OUT debug failed: %s", _e)
+        # ============================================================
         return hidden_states
 
     def _edge_cloud_forward_cloud(

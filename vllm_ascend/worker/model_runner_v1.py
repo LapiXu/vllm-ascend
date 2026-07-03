@@ -2485,6 +2485,26 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        # === 临时调试：检查 hidden_states 是否已含 NaN（区分 transformer 主体 vs lm_head）===
+        try:
+            for _name, _t in (
+                ("hidden_states", hidden_states),
+                ("sample_hidden_states", sample_hidden_states),
+            ):
+                if isinstance(_t, torch.Tensor):
+                    _tf = _t.float()
+                    logger.info(
+                        "HIDDEN %s shape=%s has_nan=%s has_inf=%s absmax=%.4f",
+                        _name,
+                        tuple(_t.shape),
+                        bool(torch.isnan(_tf).any().item()),
+                        bool(torch.isinf(_tf).any().item()),
+                        _tf.abs().max().item(),
+                    )
+        except Exception as _e:  # noqa
+            logger.info("HIDDEN debug failed: %s", _e)
+        # ============================================================
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             # here we are different from gpu_model_runner,

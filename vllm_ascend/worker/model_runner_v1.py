@@ -2539,6 +2539,14 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
         )
 
+        # === 临时调试：打印本 step 采样出的 raw token id ===
+        logger.info(
+            "SAMPLED req_ids=%s valid_sampled_token_ids=%s",
+            req_ids_output_copy,
+            valid_sampled_token_ids,
+        )
+        # ================================================
+
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
                 use_padded_batch = (

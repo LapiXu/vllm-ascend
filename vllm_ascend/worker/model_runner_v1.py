@@ -3301,6 +3301,19 @@ class NPUModelRunner(GPUModelRunner):
                         input_ids[num_actual:].fill_(0)
                     if isinstance(positions, torch.Tensor) and positions.shape[-1] > num_actual:
                         positions[..., num_actual:].fill_(0)
+                # === 临时调试：确认清零是否生效 + graph 模式 ===
+                try:
+                    _ii = input_ids.flatten() if isinstance(input_ids, torch.Tensor) else None
+                    logger.info(
+                        "SEGA-FIX num_actual=%s num_tokens_padded=%s use_graph=%s "
+                        "seg_a_graph=%s capturing=%s input_ids=%s",
+                        num_actual, num_tokens_padded, use_graph, seg_a_graph,
+                        forward_context.capturing,
+                        _ii[:num_tokens_padded].tolist() if _ii is not None else None,
+                    )
+                except Exception as _e3:  # noqa
+                    logger.info("SEGA-FIX debug failed: %s", _e3)
+                # ============================================================
                 hidden_states = seg_a(
                     input_ids=input_ids,
                     positions=positions,

@@ -3283,37 +3283,6 @@ class NPUModelRunner(GPUModelRunner):
             if _EXTRA_CTX.layer_idx is not None:
                 _EXTRA_CTX.layer_idx = 0
             try:
-                # Fix: clear the padding region of input_ids / positions before
-                # segment_a forward. In graph (FULL_DECODE_ONLY) mode the decode
-                # batch is padded up to the ACL-graph capture size (e.g. edge SP
-                # pads a single decode token to cloud_npu_count=8). The real
-                # decode path only writes the valid region [:num_actual_tokens]
-                # (see _prepare_input_ids / positions assignment), leaving stale
-                # prefill token ids and positions in the padding slots. During
-                # graph capture (dummy_run) these buffers are zeroed, so replay
-                # reads a different layout than captured, and the stale padding
-                # tokens propagate through the W8A8 head layers into NaN.
-                # Zeroing here matches the capture-time layout. Only segment_a
-                # (intermediate_tensors is None) consumes input_ids/positions.
-                num_actual = getattr(forward_context, "num_actual_tokens", None)
-                if num_actual is not None:
-                    if isinstance(input_ids, torch.Tensor) and input_ids.shape[0] > num_actual:
-                        input_ids[num_actual:].fill_(0)
-                    if isinstance(positions, torch.Tensor) and positions.shape[-1] > num_actual:
-                        positions[..., num_actual:].fill_(0)
-                # === 临时调试：确认清零是否生效 + graph 模式 ===
-                try:
-                    _ii = input_ids.flatten() if isinstance(input_ids, torch.Tensor) else None
-                    logger.info(
-                        "SEGA-FIX num_actual=%s num_tokens_padded=%s use_graph=%s "
-                        "seg_a_graph=%s capturing=%s input_ids=%s",
-                        num_actual, num_tokens_padded, use_graph, seg_a_graph,
-                        forward_context.capturing,
-                        _ii[:num_tokens_padded].tolist() if _ii is not None else None,
-                    )
-                except Exception as _e3:  # noqa
-                    logger.info("SEGA-FIX debug failed: %s", _e3)
-                # ============================================================
                 hidden_states = seg_a(
                     input_ids=input_ids,
                     positions=positions,

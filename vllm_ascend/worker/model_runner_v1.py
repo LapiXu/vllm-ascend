@@ -3283,25 +3283,24 @@ class NPUModelRunner(GPUModelRunner):
             if _EXTRA_CTX.layer_idx is not None:
                 _EXTRA_CTX.layer_idx = 0
             try:
-                # === 临时调试：检查喂入 seg_a 的 input_ids / positions padding 区间 ===
-                try:
-                    _nt = num_tokens_padded
-                    if isinstance(input_ids, torch.Tensor):
-                        _ii = input_ids.flatten()
-                        logger.info(
-                            "SEGA-IN input_ids padded_len=%d full=%s vocab_max=%s min=%s",
-                            _nt, _ii[:_nt].tolist(),
-                            int(_ii[:_nt].max().item()), int(_ii[:_nt].min().item()),
-                        )
-                    if isinstance(positions, torch.Tensor):
-                        _pp = positions.flatten()
-                        logger.info(
-                            "SEGA-IN positions padded_len=%d full=%s",
-                            _nt, _pp[:_nt].tolist(),
-                        )
-                except Exception as _e2:  # noqa
-                    logger.info("SEGA-IN debug failed: %s", _e2)
-                # ============================================================
+                # Fix: clear the padding region of input_ids / positions before
+                # segment_a forward. In graph (FULL_DECODE_ONLY) mode the decode
+                # batch is padded up to the ACL-graph capture size (e.g. edge SP
+                # pads a single decode token to cloud_npu_count=8). The real
+                # decode path only writes the valid region [:num_actual_tokens]
+                # (see _prepare_input_ids / positions assignment), leaving stale
+                # prefill token ids and positions in the padding slots. During
+                # graph capture (dummy_run) these buffers are zeroed, so replay
+                # reads a different layout than captured, and the stale padding
+                # tokens propagate through the W8A8 head layers into NaN.
+                # Zeroing here matches the capture-time layout. Only segment_a
+                # (intermediate_tensors is None) consumes input_ids/positions.
+                num_actual = getattr(forward_context, "num_actual_tokens", None)
+                if num_actual is not None:
+                    if isinstance(input_ids, torch.Tensor) and input_ids.shape[0] > num_actual:
+                        input_ids[num_actual:].fill_(0)
+                    if isinstance(positions, torch.Tensor) and positions.shape[-1] > num_actual:
+                        positions[..., num_actual:].fill_(0)
                 hidden_states = seg_a(
                     input_ids=input_ids,
                     positions=positions,

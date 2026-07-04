@@ -3283,6 +3283,25 @@ class NPUModelRunner(GPUModelRunner):
             if _EXTRA_CTX.layer_idx is not None:
                 _EXTRA_CTX.layer_idx = 0
             try:
+                # === 临时调试：检查喂入 seg_a 的 input_ids / positions padding 区间 ===
+                try:
+                    _nt = num_tokens_padded
+                    if isinstance(input_ids, torch.Tensor):
+                        _ii = input_ids.flatten()
+                        logger.info(
+                            "SEGA-IN input_ids padded_len=%d full=%s vocab_max=%s min=%s",
+                            _nt, _ii[:_nt].tolist(),
+                            int(_ii[:_nt].max().item()), int(_ii[:_nt].min().item()),
+                        )
+                    if isinstance(positions, torch.Tensor):
+                        _pp = positions.flatten()
+                        logger.info(
+                            "SEGA-IN positions padded_len=%d full=%s",
+                            _nt, _pp[:_nt].tolist(),
+                        )
+                except Exception as _e2:  # noqa
+                    logger.info("SEGA-IN debug failed: %s", _e2)
+                # ============================================================
                 hidden_states = seg_a(
                     input_ids=input_ids,
                     positions=positions,

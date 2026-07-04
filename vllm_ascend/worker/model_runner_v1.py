@@ -3404,6 +3404,21 @@ class NPUModelRunner(GPUModelRunner):
         old_layer_idx = _EXTRA_CTX.layer_idx
         if _EXTRA_CTX.layer_idx is not None:
             _EXTRA_CTX.layer_idx = self.head_k
+        # === 临时调试：检查 Cloud 从 Edge 收到的 segment_c 输入是否含 NaN ===
+        try:
+            if isinstance(intermediate_tensors, IntermediateTensors):
+                for _k, _v in intermediate_tensors.tensors.items():
+                    _vf = _v.float()
+                    logger.info(
+                        "CLOUD-RECV-IN from edge key=%s shape=%s has_nan=%s has_inf=%s absmax=%.4f",
+                        _k, tuple(_v.shape),
+                        bool(torch.isnan(_vf).any().item()),
+                        bool(torch.isinf(_vf).any().item()),
+                        _vf.abs().max().item(),
+                    )
+        except Exception as _e:  # noqa
+            logger.info("CLOUD-RECV-IN debug failed: %s", _e)
+        # ============================================================
         try:
             hidden_states = seg_c(
                 positions=positions,
@@ -3419,6 +3434,22 @@ class NPUModelRunner(GPUModelRunner):
         finally:
             if old_layer_idx is not None:
                 _EXTRA_CTX.layer_idx = old_layer_idx
+
+        # === 临时调试：检查 segment_c（cloud 中间层）输出是否含 NaN ===
+        try:
+            if isinstance(hidden_states, IntermediateTensors):
+                for _k, _v in hidden_states.tensors.items():
+                    _vf = _v.float()
+                    logger.info(
+                        "CLOUD-SEGC-OUT key=%s shape=%s has_nan=%s has_inf=%s absmax=%.4f",
+                        _k, tuple(_v.shape),
+                        bool(torch.isnan(_vf).any().item()),
+                        bool(torch.isinf(_vf).any().item()),
+                        _vf.abs().max().item(),
+                    )
+        except Exception as _e:  # noqa
+            logger.info("CLOUD-SEGC-OUT debug failed: %s", _e)
+        # ============================================================
 
         # Cloud 必须返回 IntermediateTensors，供 Worker 层发回 Edge 并最终由 Edge 计算 logits
         assert isinstance(hidden_states, IntermediateTensors)

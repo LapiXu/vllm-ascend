@@ -878,6 +878,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             max_seq_lens = _seq_lens_cpu[: self.num_decodes].max().item()
             decode_input_positions = input_positions_cpu
             seq_lens_list = _seq_lens_cpu[: self.num_decodes].tolist()
+            # === 临时调试：打印本 decode step 的真实 seq_len ===
+            from vllm.logger import logger as _dsa_lg
+            _dsa_lg.info(
+                "DSA-DECODE seq_lens_list=%s max_seq_lens=%s num_decodes=%s",
+                seq_lens_list, max_seq_lens, self.num_decodes,
+            )
+            # ================================================
             self.decode_ratio_to_sas_metadata["query_start_loc_cpu"] = query_start_loc_cpu
             self.decode_ratio_to_sas_metadata["decode_input_positions"] = decode_input_positions
             self.decode_ratio_to_sas_metadata["max_seq_lens"] = max_seq_lens

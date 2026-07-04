@@ -110,12 +110,43 @@ def _forward_edge_cloud_segment_v4(
     # When enabled, compute it from config (see DeepseekV4Model.forward).
     llama_4_scaling = None
     for idx, layer in enumerate(islice(self.layers, start_layer, end_layer)):
+        # === 临时调试：逐层检查 NaN 起源（仅 segment_a: start_layer==0）===
+        _real_idx = start_layer + idx
+        try:
+            import torch as _torch
+            _hn = bool(_torch.isnan(hidden_states.float()).any().item())
+            _rn = (residual is not None) and bool(_torch.isnan(residual.float()).any().item())
+            from vllm.logger import logger as _lg
+            _lg.info(
+                "SEGA-LAYER-IN layer=%d hidden_nan=%s residual_nan=%s "
+                "hidden_absmax=%.4f",
+                _real_idx, _hn, _rn,
+                hidden_states.float().abs().max().item(),
+            )
+        except Exception as _e:  # noqa
+            pass
+        # ============================================================
         hidden_states, residual = layer(
             positions,
             hidden_states,
             residual,
             llama_4_scaling,
         )
+        # === 临时调试：本层输出 NaN 检查 ===
+        try:
+            import torch as _torch
+            _hn = bool(_torch.isnan(hidden_states.float()).any().item())
+            _rn = (residual is not None) and bool(_torch.isnan(residual.float()).any().item())
+            from vllm.logger import logger as _lg
+            _lg.info(
+                "SEGA-LAYER-OUT layer=%d hidden_nan=%s residual_nan=%s "
+                "hidden_absmax=%.4f",
+                _real_idx, _hn, _rn,
+                hidden_states.float().abs().max().item(),
+            )
+        except Exception as _e:  # noqa
+            pass
+        # ============================================================
 
     # ----- Return intermediate state or final hidden_states -----
     # In the "head-3 / tail-1" edge-cloud scheme, all Hash MoE layers reside

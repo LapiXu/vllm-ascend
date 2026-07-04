@@ -3300,6 +3300,20 @@ class NPUModelRunner(GPUModelRunner):
                     _EXTRA_CTX.layer_idx = old_layer_idx
 
             assert isinstance(hidden_states, IntermediateTensors)
+            # === 临时调试：检查 edge segment_a 送往 cloud 前是否含 NaN ===
+            try:
+                for _k, _v in hidden_states.tensors.items():
+                    _vf = _v.float()
+                    logger.info(
+                        "EDGE-SEGA-OUT (to cloud) key=%s shape=%s has_nan=%s has_inf=%s absmax=%.4f",
+                        _k, tuple(_v.shape),
+                        bool(torch.isnan(_vf).any().item()),
+                        bool(torch.isinf(_vf).any().item()),
+                        _vf.abs().max().item(),
+                    )
+            except Exception as _e:  # noqa
+                logger.info("EDGE-SEGA-OUT debug failed: %s", _e)
+            # ============================================================
             return hidden_states
 
         # Step 2：执行 Segment E（尾 tail_k 层 + norm）

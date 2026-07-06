@@ -15,6 +15,11 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2Model,
 )
 from vllm.sequence import IntermediateTensors
+from vllm_ascend.edge_cloud_materialized import (
+    apply_final_norm,
+    make_boundary_tensors,
+    restore_boundary_state,
+)
 
 
 def _forward_edge_cloud_segment_deepseek_v2(
@@ -50,8 +55,7 @@ def _forward_edge_cloud_segment_deepseek_v2(
             "intermediate_tensors is None in edge-cloud segment; "
             "check that all TP ranks receive tensors correctly."
         )
-        hidden_states = intermediate_tensors["hidden_states"]
-        residual = intermediate_tensors["residual"]
+        hidden_states, residual = restore_boundary_state(self, intermediate_tensors)
 
     # DeepseekV2DecoderLayer.forward does not accept **kwargs; do not forward
     # extra_layer_kwargs here or unrelated model_kwargs will raise TypeError.
@@ -77,8 +81,7 @@ def _forward_edge_cloud_segment_deepseek_v2(
             tensors["aux_hidden_states"] = torch.cat(aux_hidden_states, dim=-1)
         return IntermediateTensors(tensors)
 
-    hidden_states, _ = self.norm(hidden_states, residual)
-    return hidden_states
+    return apply_final_norm(self.norm, hidden_states, residual)
 
 
 def _deepseek_v2_lm_forward_edge_cloud_segment(

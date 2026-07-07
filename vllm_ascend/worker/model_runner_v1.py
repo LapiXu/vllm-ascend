@@ -3423,16 +3423,14 @@ class NPUModelRunner(GPUModelRunner):
             }
         )
         # [EC-DIAG] cross-node tensor received & sliced (temporary).
+        # Metadata only — no .cpu()/isnan here (async irecv window, would hang).
         role = getattr(self.edge_cloud_cfg, "role", "?")
         nr = getattr(self.input_batch, "num_reqs", -1)
         msg = [f"[EC-DIAG] {role} RECV+slice num_reqs={nr} num_tokens={num_tokens} tp={tp}"]
         for k in ("hidden_states", "residual"):
             t = result[k] if k in result else None
             if isinstance(t, torch.Tensor) and t.numel():
-                f = t.detach().float()
-                n = (f.norm(dim=tuple(range(1, f.dim()))) if f.dim() > 1 else f.abs())[:8]
-                msg.append(f"  {k}: shape={tuple(t.shape)} nan={bool(torch.isnan(f).any())} "
-                           f"inf={bool(torch.isinf(f).any())} per_token_norm={[round(x,3) for x in n.cpu().tolist()]}")
+                msg.append(f"  {k}: shape={tuple(t.shape)} dtype={t.dtype}")
         logger.info("\n".join(msg))
         return result
 

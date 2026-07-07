@@ -91,14 +91,14 @@ torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_grap
 
 
 # [EC-DIAG] Edge-cloud diagnostic (temporary, remove after debugging).
+# NOTE: metadata only (shape/dtype). Do NOT call .cpu()/.item()/isnan here —
+# these points sit inside the async HCCL send/recv path and any forced device
+# sync will deadlock the collective communication.
 def _ec_stat(t):
-    """One-line stats (shape / nan / inf / per-token norm) for a tensor."""
+    """One-line shape/dtype for a tensor. No device sync."""
     if not isinstance(t, torch.Tensor) or not t.numel():
         return "n/a"
-    f = t.detach().float()
-    n = (f.norm(dim=tuple(range(1, f.dim()))) if f.dim() > 1 else f.abs())[:8]
-    return (f"shape={tuple(t.shape)} nan={bool(torch.isnan(f).any())} "
-            f"inf={bool(torch.isinf(f).any())} norm={[round(x,3) for x in n.cpu().tolist()]}")
+    return f"shape={tuple(t.shape)} dtype={t.dtype}"
 
 
 def _detect_has_residual(model_config) -> bool:

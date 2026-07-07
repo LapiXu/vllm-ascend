@@ -2495,6 +2495,27 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to(self.device).to(logits_dtype)
 
         with record_function_or_nullcontext("sample_token"):
+            # [EC-DIAG] per-request logits check (temporary). Safe: runs after
+            # all edge-cloud HCCL comm has completed (state unpacked above) and
+            # this function already does logits.to("cpu") for grammar masks.
+            try:
+                if (isinstance(logits, torch.Tensor) and logits.dim() == 2
+                        and logits.shape[0] > 1):
+                    lf = logits.detach().float()
+                    nreqs = self.input_batch.num_reqs
+                    rids = list(self.input_batch.req_ids)[:nreqs]
+                    mx, am = lf.max(dim=-1)
+                    parts = []
+                    for i in range(min(nreqs, lf.shape[0])):
+                        rid = rids[i] if i < len(rids) else "?"
+                        parts.append(f"row{i}({rid}): argmax={int(am[i])} "
+                                     f"max={float(mx[i]):.3f} "
+                                     f"nan={bool(torch.isnan(lf[i]).any())} "
+                                     f"inf={bool(torch.isinf(lf[i]).any())}")
+                    logger.info(f"[EC-DIAG] LOGITS shape={tuple(logits.shape)} | "
+                                + " || ".join(parts))
+            except Exception as _e:
+                logger.info(f"[EC-DIAG] LOGITS log failed: {_e}")
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self.need_accepted_tokens:
@@ -3414,7 +3435,7 @@ class NPUModelRunner(GPUModelRunner):
                     if recv_len < copy_len:
                         dst[recv_len:].zero_()
 
-        result = IntermediateTensors(
+        return IntermediateTensors(
             {
                 k: v[: (num_tokens + tp - 1) // tp]
                 if enable_sp()
@@ -3422,17 +3443,6 @@ class NPUModelRunner(GPUModelRunner):
                 for k, v in self.intermediate_tensors.items()
             }
         )
-        # [EC-DIAG] cross-node tensor received & sliced (temporary).
-        # Metadata only — no .cpu()/isnan here (async irecv window, would hang).
-        role = getattr(self.edge_cloud_cfg, "role", "?")
-        nr = getattr(self.input_batch, "num_reqs", -1)
-        msg = [f"[EC-DIAG] {role} RECV+slice num_reqs={nr} num_tokens={num_tokens} tp={tp}"]
-        for k in ("hidden_states", "residual"):
-            t = result[k] if k in result else None
-            if isinstance(t, torch.Tensor) and t.numel():
-                msg.append(f"  {k}: shape={tuple(t.shape)} dtype={t.dtype}")
-        logger.info("\n".join(msg))
-        return result
 
     def sync_and_gather_intermediate_tensors(
         self,

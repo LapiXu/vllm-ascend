@@ -90,6 +90,17 @@ torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFun
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
 
 
+# [EC-DIAG] Edge-cloud diagnostic (temporary, remove after debugging).
+def _ec_stat(t):
+    """One-line stats (shape / nan / inf / per-token norm) for a tensor."""
+    if not isinstance(t, torch.Tensor) or not t.numel():
+        return "n/a"
+    f = t.detach().float()
+    n = (f.norm(dim=tuple(range(1, f.dim()))) if f.dim() > 1 else f.abs())[:8]
+    return (f"shape={tuple(t.shape)} nan={bool(torch.isnan(f).any())} "
+            f"inf={bool(torch.isinf(f).any())} norm={[round(x,3) for x in n.cpu().tolist()]}")
+
+
 def _detect_has_residual(model_config) -> bool:
     """Detect whether the model produces a residual tensor in IntermediateTensors.
 
@@ -586,6 +597,11 @@ class NPUWorker(WorkerBase):
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
         if is_edge_device():
+            _nr = getattr(self.model_runner.input_batch, "num_reqs", -1)
+            _nt = scheduler_output.total_num_scheduled_tokens
+            logger.info(f"[EC-DIAG] edge segment_a OUT num_reqs={_nr} num_tokens={_nt} "
+                        f"hidden={_ec_stat(output.tensors.get('hidden_states'))} "
+                        f"residual={_ec_stat(output.tensors.get('residual'))}")
             # Edge-cloud with heterogeneous SP: aggregate SP shards to full
             # sequence before cross-PP send so cloud can re-chunk by its SP.
             if enable_sp() and (self.model_runner.edge_cloud_cfg.mode != "embedding_only"
@@ -593,6 +609,9 @@ class NPUWorker(WorkerBase):
                 _gathered = self._all_gather_tensor_dict(output.tensors)
             else:
                 _gathered = output.tensors
+            logger.info(f"[EC-DIAG] edge->cloud SEND num_reqs={_nr} num_tokens={_nt} "
+                        f"hidden={_ec_stat(_gathered.get('hidden_states'))} "
+                        f"residual={_ec_stat(_gathered.get('residual'))}")
             if get_pp_group().world_size == 2:
                 # Pass scheduler total so the sender slices off any
                 # cudagraph / SP / DP padding, letting the cloud receiver
@@ -618,19 +637,31 @@ class NPUWorker(WorkerBase):
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
-           
+
             output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
             if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
                 return output
+            if isinstance(output, IntermediateTensors):
+                logger.info(f"[EC-DIAG] edge segment_e OUT (final) num_reqs={_nr} num_tokens={_nt} "
+                            f"hidden={_ec_stat(output.tensors.get('hidden_states'))} "
+                            f"residual={_ec_stat(output.tensors.get('residual'))}")
             return output
 
         if is_cloud_device():
+            _nr = getattr(self.model_runner.input_batch, "num_reqs", -1)
+            _nt = scheduler_output.total_num_scheduled_tokens
+            logger.info(f"[EC-DIAG] cloud segment_c OUT num_reqs={_nr} num_tokens={_nt} "
+                        f"hidden={_ec_stat(output.tensors.get('hidden_states'))} "
+                        f"residual={_ec_stat(output.tensors.get('residual'))}")
             # Edge-cloud with heterogeneous SP: aggregate SP shards to full
             # sequence before cross-PP send so edge can re-chunk by its SP.
             if enable_sp():
                 _gathered = self._all_gather_tensor_dict(output.tensors)
             else:
                 _gathered = output.tensors
+            logger.info(f"[EC-DIAG] cloud->edge SEND num_reqs={_nr} num_tokens={_nt} "
+                        f"hidden={_ec_stat(_gathered.get('hidden_states'))} "
+                        f"residual={_ec_stat(_gathered.get('residual'))}")
             if get_pp_group().world_size == 2:
                 # Cloud segment_c runs through full transformer layers and
                 # almost always with cudagraph / SP / DP padding enabled, so

@@ -943,6 +943,12 @@ def edge_cloud_irecv_tensor_dict(
         handle = torch.distributed.irecv(
             recv_view, src=pp_group.ranks[src], group=group
         )
+        # Zero-fill the SP padding tail (see the non-merge path for why).
+        # The merged buffer is TP-broadcast and split into per-key tensors,
+        # so the tail padding flows into every per-key tensor; it must be
+        # zero before the broadcast reads it.
+        if merged.shape[0] > num_tokens:
+            merged[num_tokens:].zero_()
 
         # Pre-populate the dict with empty placeholders so callers can see
         # the expected keys even before postprocess runs.  We replace them
@@ -990,6 +996,20 @@ def edge_cloud_irecv_tensor_dict(
                     recv_view, src=pp_group.ranks[src], group=group
                 )
                 handles.append(handle)
+                # Zero-fill the SP padding tail.  The sender only transmits
+                # the real num_tokens rows; the remaining
+                # (recv_num_tokens - num_tokens) rows are padding to satisfy
+                # SP's TP-divisibility and must be zero, not torch.empty's
+                # uninitialized memory.  Garbage here is read by downstream
+                # ops that iterate over the full TP-padded buffer (SP
+                # all-gather inside attention, DSA compression, hc_head/norm)
+                # and probabilistically corrupts batched requests on 3D
+                # (DeepSeek V4) models.  Runs on the compute stream
+                # concurrent with the HCCL irecv (disjoint regions); the
+                # irecv handle wait plus the next HCCL op's compute->HCCL
+                # sync make it visible before any read.
+                if recv_num_tokens > num_tokens:
+                    full_tensor[num_tokens:].zero_()
             else:
                 # The sender skipped this tensor (e.g. the zero residual in
                 # embedding_only e2c). Keep the buffer zeroed so the model

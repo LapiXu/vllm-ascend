@@ -486,26 +486,24 @@ class NPUWorker(WorkerBase):
         Used in edge-cloud mode when edge and cloud have different SP sizes.
         Before cross-PP send, each side must aggregate its SP shards back to
         the full sequence so the remote side can re-chunk with its own SP size.
+
+        Only the all-gather happens here; the gathered tensor is *not* padded
+        to the remote TP size.  The sender transmits only the real
+        ``num_tokens`` rows (sliced in edge_cloud_isend_tensor_dict via the
+        ``num_tokens`` argument), and the receiver zero-pads its buffer up to
+        its own local TP size (see ``_pad_num_tokens_to_tp_multiple``).  So a
+        send-side pad to the remote TP size is redundant — its dim-0 rows are
+        sliced off before send — and for 3D ``(num_tokens, hc_mult, hidden)``
+        tensors (DeepSeek V4) it is actively harmful: ``F.pad(t, (0, 0, 0,
+        pad_len))`` pads the hc_mult axis (second-to-last), not the sequence
+        axis, corrupting the tensor and tripping the isend non-dim-0 shape
+        check.
         """
         tp_group = get_tp_group()
-        pc = self.vllm_config.parallel_config
-        # In edge-cloud mode, ensure the all-gathered length is also padded to
-        # the remote side's TP size so no extra padding is needed after recv.
-        target_tp_size = None
-        if pc.enable_edge_cloud:
-            target_tp_size = pc.cloud_npu_count if pc.is_edge_node else pc.edge_npu_count
-
         result = {}
         for key, tensor in tensor_dict.items():
             if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
                 gathered = tp_group.all_gather(tensor, dim=0)
-                # Pad sequence to target_tp_size if heterogeneous SP is used
-                if target_tp_size is not None and target_tp_size > 1:
-                    seq_len = gathered.size(0)
-                    remainder = seq_len % target_tp_size
-                    if remainder != 0:
-                        pad_len = target_tp_size - remainder
-                        gathered = torch.nn.functional.pad(gathered, (0, 0, 0, pad_len))
                 result[key] = gathered
             else:
                 result[key] = tensor

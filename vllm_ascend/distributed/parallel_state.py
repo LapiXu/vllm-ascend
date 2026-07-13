@@ -878,6 +878,52 @@ def _split_merged_buffer_into_dict(
     return out
 
 
+def simulate_merge_recv_peak_memory(num_tokens: int) -> None:
+    """Reproduce the transient NPU memory peak of the merge recv/split path.
+
+    The edge-cloud merge fast path (``merge_payload=True``) transiently holds
+    two large buffers at once on the receiver: the merged P2P/broadcast buffer
+    (``hidden_states`` + ``residual`` concatenated along dim=-1) and, while
+    ``_split_merged_buffer_into_dict`` runs, one ``.contiguous()`` copy per key.
+    At the moment the last key is copied both the full merged buffer and all
+    per-key copies are alive simultaneously, so the peak is ~2x the merged
+    buffer.
+
+    This peak happens *inside* a comm_postprocess callback during real
+    execution, on a code path that ``profile_run``'s dummy forward never
+    exercises (the dummy run builds intermediate tensors locally via
+    ``make_empty_intermediate_tensors`` instead of receiving them).  As a
+    result the startup memory profiler underestimates non-KV-cache memory and
+    hands too much to the KV cache pool, which can OOM at high
+    ``gpu_memory_utilization`` when this peak lands on top of a nearly-full
+    device (typically PP-rank0/TP0, which also owns the cross-node irecv
+    buffer).
+
+    Calling this during profiling forces the same allocation pattern so the
+    torch peak-memory statistic captures it; ``determine_available_memory``
+    then reserves it and shrinks the KV cache pool accordingly.  The buffers
+    are released before returning.  Safe no-op when merge is disabled or there
+    is no PP peer to receive from.
+    """
+    ec_meta = _select_edge_cloud_meta_for_recv()
+    if not ec_meta.merge_payload:
+        return
+    pp_group = get_pp_group()
+    if not torch.distributed.is_initialized() or pp_group.world_size == 1:
+        return
+    if num_tokens <= 0:
+        return
+
+    # Allocate the merged buffer at the same shape real execution would use,
+    # then materialize the per-key contiguous copies exactly as the split does.
+    # Holding `merged` + `split` alive together mirrors the runtime 2x peak.
+    merged = _allocate_merged_recv_buffer(ec_meta, num_tokens)
+    split = _split_merged_buffer_into_dict(merged, ec_meta)
+    # Reference both so neither is freed before the peak is recorded, then drop.
+    del split
+    del merged
+
+
 def _pad_num_tokens_to_tp_multiple(num_tokens: int) -> int:
     """Round num_tokens up to the local TP size when SP is enabled.
 

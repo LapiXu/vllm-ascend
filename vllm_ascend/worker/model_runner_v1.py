@@ -4329,9 +4329,36 @@ class NPUModelRunner(GPUModelRunner):
             self.supports_mm_inputs = False
         try:
             super().profile_run()
+            self._profile_edge_cloud_merge_peak()
         finally:
             self.supports_mm_inputs = original_supports_mm_inputs
             self.max_num_tokens = origin_max_num_tokens
+
+    def _profile_edge_cloud_merge_peak(self) -> None:
+        """Force the edge-cloud merge recv/split memory peak during profiling.
+
+        The merge fast path transiently holds the merged recv buffer plus its
+        per-key ``.contiguous()`` copies at once (~2x the merged buffer). That
+        peak occurs inside a comm_postprocess callback at runtime, which the
+        dummy forward above never exercises, so the memory profiler would
+        otherwise under-reserve non-KV-cache memory and over-allocate the KV
+        cache pool — causing OOM at high gpu_memory_utilization. Reproducing
+        the allocation here lets the torch peak-memory statistic capture it so
+        ``determine_available_memory`` reserves it. Gated by
+        VLLM_ASCEND_EDGE_CLOUD_PROFILE_MERGE_PEAK; no-op unless edge-cloud is
+        enabled and merge is active.
+        """
+        if not self._edge_cloud_enabled:
+            return
+        import vllm_ascend.envs as envs_ascend
+        if not envs_ascend.VLLM_ASCEND_EDGE_CLOUD_PROFILE_MERGE_PEAK:
+            return
+        from vllm_ascend.distributed.parallel_state import (
+            simulate_merge_recv_peak_memory,
+        )
+        # Size the buffer at the runtime worst case (max batched tokens), so the
+        # reserved peak covers the largest split the scheduler can produce.
+        simulate_merge_recv_peak_memory(self.max_num_tokens)
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:

@@ -256,3 +256,98 @@ def test_init_meta_direction_aware_head_tail():
     assert c2e.send_tensor_keys == ["hidden_states", "residual"]
     assert e2c.merge_payload is True
     assert c2e.merge_payload is True
+
+
+# ---------------------------------------------------------------------------
+# Profiling-time merge peak reservation (simulate_merge_recv_peak_memory)
+# ---------------------------------------------------------------------------
+
+def test_simulate_merge_peak_allocates_when_merge_enabled():
+    """When merge is active, the profiler helper allocates the merged buffer
+    (at the requested num_tokens) and materializes the per-key split copies,
+    so the torch peak-memory statistic captures the ~2x runtime peak."""
+    H = 16
+    N = 12
+    meta = _build_meta_2d(H)
+
+    allocated = {}
+
+    def _fake_alloc(ec_meta, num_tokens):
+        buf = torch.zeros((num_tokens,) + ec_meta.merged_shape_tail,
+                          dtype=ec_meta.merged_dtype)
+        allocated["buf"] = buf
+        allocated["num_tokens"] = num_tokens
+        return buf
+
+    with patch.object(ps, "_select_edge_cloud_meta_for_recv", return_value=meta), \
+         patch.object(ps, "_allocate_merged_recv_buffer", side_effect=_fake_alloc), \
+         patch.object(ps, "get_pp_group",
+                      return_value=type("G", (), {"world_size": 2})()), \
+         patch.object(ps.torch.distributed, "is_initialized", return_value=True):
+        ps.simulate_merge_recv_peak_memory(N)
+
+    # The buffer must be sized at the runtime worst-case token count and carry
+    # both tensors concatenated along dim=-1 (2 * H).
+    assert allocated["num_tokens"] == N
+    assert allocated["buf"].shape == (N, 2 * H)
+
+
+def test_simulate_merge_peak_noop_when_merge_disabled():
+    """merge_payload=False → no allocation attempted (safe no-op)."""
+    meta = _build_meta_2d(16)
+    meta.merge_payload = False
+
+    called = {"alloc": False}
+
+    def _fake_alloc(ec_meta, num_tokens):
+        called["alloc"] = True
+        return torch.zeros(1)
+
+    with patch.object(ps, "_select_edge_cloud_meta_for_recv", return_value=meta), \
+         patch.object(ps, "_allocate_merged_recv_buffer", side_effect=_fake_alloc), \
+         patch.object(ps, "get_pp_group",
+                      return_value=type("G", (), {"world_size": 2})()), \
+         patch.object(ps.torch.distributed, "is_initialized", return_value=True):
+        ps.simulate_merge_recv_peak_memory(128)
+
+    assert called["alloc"] is False
+
+
+def test_simulate_merge_peak_noop_without_pp_peer():
+    """world_size == 1 (no PP peer to receive from) → no-op."""
+    meta = _build_meta_2d(16)
+
+    called = {"alloc": False}
+
+    def _fake_alloc(ec_meta, num_tokens):
+        called["alloc"] = True
+        return torch.zeros(1)
+
+    with patch.object(ps, "_select_edge_cloud_meta_for_recv", return_value=meta), \
+         patch.object(ps, "_allocate_merged_recv_buffer", side_effect=_fake_alloc), \
+         patch.object(ps, "get_pp_group",
+                      return_value=type("G", (), {"world_size": 1})()), \
+         patch.object(ps.torch.distributed, "is_initialized", return_value=True):
+        ps.simulate_merge_recv_peak_memory(128)
+
+    assert called["alloc"] is False
+
+
+def test_simulate_merge_peak_noop_on_nonpositive_tokens():
+    """num_tokens <= 0 → no-op (nothing to reserve)."""
+    meta = _build_meta_2d(16)
+
+    called = {"alloc": False}
+
+    def _fake_alloc(ec_meta, num_tokens):
+        called["alloc"] = True
+        return torch.zeros(1)
+
+    with patch.object(ps, "_select_edge_cloud_meta_for_recv", return_value=meta), \
+         patch.object(ps, "_allocate_merged_recv_buffer", side_effect=_fake_alloc), \
+         patch.object(ps, "get_pp_group",
+                      return_value=type("G", (), {"world_size": 2})()), \
+         patch.object(ps.torch.distributed, "is_initialized", return_value=True):
+        ps.simulate_merge_recv_peak_memory(0)
+
+    assert called["alloc"] is False

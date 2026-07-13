@@ -121,6 +121,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD": lambda: bool(
         int(os.getenv("VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD", "1"))
     ),
+    # Edge-cloud: during startup memory profiling, reproduce the transient
+    # merge-path recv/split memory peak (~2x the merged buffer) so the profiler
+    # reserves it and shrinks the KV cache pool accordingly. Prevents OOM at
+    # high gpu_memory_utilization (e.g. 0.95) when the peak lands on a
+    # nearly-full device. Default 1 (enabled). Set to 0 to disable the
+    # reservation and revert to the previous (under-reserving) behavior.
+    "VLLM_ASCEND_EDGE_CLOUD_PROFILE_MERGE_PEAK": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_EDGE_CLOUD_PROFILE_MERGE_PEAK", "1"))
+    ),
 }
 
 # end-env-vars-definition

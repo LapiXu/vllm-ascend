@@ -907,11 +907,20 @@ def simulate_merge_recv_peak_memory(num_tokens: int) -> None:
     """
     ec_meta = _select_edge_cloud_meta_for_recv()
     if not ec_meta.merge_payload:
+        logger.info("[edge-cloud][profile] recv peak skipped: merge_payload=False")
         return
     pp_group = get_pp_group()
     if not torch.distributed.is_initialized() or pp_group.world_size == 1:
+        logger.info(
+            "[edge-cloud][profile] recv peak skipped: no PP peer "
+            "(dist_init=%s, pp_world_size=%d)",
+            torch.distributed.is_initialized(), pp_group.world_size,
+        )
         return
     if num_tokens <= 0:
+        logger.info(
+            "[edge-cloud][profile] recv peak skipped: num_tokens=%d", num_tokens
+        )
         return
 
     # Allocate the merged buffer at the same shape real execution would use,
@@ -919,9 +928,79 @@ def simulate_merge_recv_peak_memory(num_tokens: int) -> None:
     # Holding `merged` + `split` alive together mirrors the runtime 2x peak.
     merged = _allocate_merged_recv_buffer(ec_meta, num_tokens)
     split = _split_merged_buffer_into_dict(merged, ec_meta)
+    merged_gib = merged.numel() * merged.element_size() / (1024 ** 3)
+    logger.info(
+        "[edge-cloud][profile] recv peak reserved: merged=%.3f GiB, "
+        "~2x peak=%.3f GiB (num_tokens=%d, shape_tail=%s)",
+        merged_gib, 2 * merged_gib, num_tokens, ec_meta.merged_shape_tail,
+    )
     # Reference both so neither is freed before the peak is recorded, then drop.
     del split
     del merged
+
+
+def simulate_merge_send_peak_memory(num_tokens: int) -> None:
+    """Reproduce the transient NPU memory peak of the merge send/cat path.
+
+    On the sender, ``edge_cloud_isend_tensor_dict`` concatenates the per-key
+    tensors (``hidden_states`` + ``residual``) into a single fresh contiguous
+    buffer via ``torch.cat(pieces, dim=-1)`` before the isend.  At the cat
+    moment the source tensors and the freshly-allocated merged buffer are both
+    alive, so the sender transiently needs ~1x the merged buffer on top of the
+    intermediate tensors it already holds.
+
+    Like the recv split, this ``cat`` runs only during real execution
+    (inside ``edge_cloud_isend_tensor_dict``), never during ``profile_run``'s
+    dummy forward, so the memory profiler does not see it and under-reserves.
+    This function forces the same allocation during profiling so the peak is
+    captured and reserved.  Uses the send-direction meta.  Safe no-op when
+    merge is disabled or there is no PP peer to send to.
+    """
+    ec_meta = _select_edge_cloud_meta_for_send()
+    if not ec_meta.merge_payload:
+        logger.info("[edge-cloud][profile] send peak skipped: merge_payload=False")
+        return
+    pp_group = get_pp_group()
+    if not torch.distributed.is_initialized() or pp_group.world_size == 1:
+        logger.info(
+            "[edge-cloud][profile] send peak skipped: no PP peer "
+            "(dist_init=%s, pp_world_size=%d)",
+            torch.distributed.is_initialized(), pp_group.world_size,
+        )
+        return
+    if num_tokens <= 0:
+        logger.info(
+            "[edge-cloud][profile] send peak skipped: num_tokens=%d", num_tokens
+        )
+        return
+    if ec_meta.merged_dtype is None or ec_meta.merged_shape_tail is None:
+        logger.info(
+            "[edge-cloud][profile] send peak skipped: merged meta incomplete"
+        )
+        return
+
+    # Mirror the runtime cat: allocate one source piece per sent key, then cat
+    # them into a fresh merged buffer.  Holding both alive reproduces the peak.
+    send_keys = ec_meta.send_tensor_keys or ec_meta.tensor_keys
+    assert ec_meta.split_sizes is not None
+    pieces = []
+    # merged_shape_tail is (…, sum(split_sizes)); each piece keeps the same
+    # leading dims but only its own last-dim slice.
+    lead = ec_meta.merged_shape_tail[:-1]
+    for length in ec_meta.split_sizes[:len(send_keys)]:
+        pieces.append(
+            torch.empty((num_tokens,) + lead + (length,),
+                        dtype=ec_meta.merged_dtype, device="npu")
+        )
+    merged = torch.cat(pieces, dim=-1)
+    merged_gib = merged.numel() * merged.element_size() / (1024 ** 3)
+    logger.info(
+        "[edge-cloud][profile] send peak reserved: cat merged=%.3f GiB "
+        "(num_tokens=%d, pieces=%d)",
+        merged_gib, num_tokens, len(pieces),
+    )
+    del merged
+    del pieces
 
 
 def _pad_num_tokens_to_tp_multiple(num_tokens: int) -> int:

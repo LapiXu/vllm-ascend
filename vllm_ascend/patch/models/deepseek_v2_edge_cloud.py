@@ -71,15 +71,11 @@ def _forward_edge_cloud_segment_deepseek_v2(
         hidden_states, residual = layer(positions, hidden_states, residual)
 
     if not is_last_segment:
-        if residual is None:
-            residual = torch.zeros_like(hidden_states)
-        tensors: dict[str, torch.Tensor | None] = {
-            "hidden_states": hidden_states,
-            "residual": residual,
-        }
+        tensors = make_boundary_tensors(self, hidden_states, residual)
         if aux_hidden_states:
-            tensors["aux_hidden_states"] = torch.cat(aux_hidden_states, dim=-1)
-        return IntermediateTensors(tensors)
+            # aux_hidden_states is always present regardless of materialization
+            tensors._tensors["aux_hidden_states"] = torch.cat(aux_hidden_states, dim=-1)
+        return tensors
 
     return apply_final_norm(self.norm, hidden_states, residual)
 

@@ -420,23 +420,15 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
                 #    offsets used in ``execute_model_batched_tail``
                 #    (one slice per ``bundles[i]``'s actual
                 # token count — NOT per ``logits_indices``).
-                # Use the per-bundle actual token count (from
-                # the bundle's attn metadata) as the source of
-                # truth, NOT ``intermediates[i]['hidden_states']
-                # .shape[0]`` (which may not reflect the actual
-                # count after the cloud cudagraph pass).
-                def _per_bundle_actual(b) -> int:
-                    md = b.attn_metadata
-                    if isinstance(md, list) and md:
-                        md = md[0][next(iter(md[0]))]
-                    else:
-                        md = next(iter(md.values()))
-                    return md.num_actual_tokens
-
+                # Use the scheduler-backed per-bundle actual token count as
+                # the source of truth, NOT attention metadata (which is
+                # legitimately empty on an embedding-only edge) or
+                # ``intermediates[i]['hidden_states'].shape[0]`` (which may
+                # include padding from the cloud cudagraph pass).
                 token_offsets = [0]
                 for b in bundles:
                     token_offsets.append(
-                        token_offsets[-1] + _per_bundle_actual(b))
+                        token_offsets[-1] + b.num_actual_tokens)
                 logits_offsets = [0]
                 for b in bundles:
                     logits_offsets.append(

@@ -88,6 +88,13 @@ class EdgeCloudTensorMeta:
     # so the receiver still allocates a residual buffer but zero-fills it locally
     # instead of receiving it. Defaults to tensor_keys when send/recv are identical.
     send_tensor_keys: list[str] | None = None
+    # Subset of tensor_keys that share the same dtype and non-last-dim shape:
+    # these are concatenated along dim=-1 into the single merged buffer.
+    # Heterogeneous keys (e.g. mrope_positions, int64 vs bf16 hidden/residual)
+    # are excluded and sent/received as individual isend/irecv instead, so they
+    # do not force the whole batch to fall back to no-merge. Empty when
+    # merge_payload is False.
+    merge_keys: list[str] = None  # type: ignore[assignment]
 
 
 def _build_edge_cloud_tensor_meta(
@@ -96,6 +103,7 @@ def _build_edge_cloud_tensor_meta(
     recv_has_residual: bool,
     send_has_residual: bool,
     hc_mult: int,
+    uses_mrope: bool = False,
 ) -> EdgeCloudTensorMeta:
     """Build a single direction's EdgeCloudTensorMeta.
 
@@ -131,6 +139,20 @@ def _build_edge_cloud_tensor_meta(
     if send_has_residual:
         send_tensor_keys = list(tensor_keys)
 
+    if uses_mrope:
+        # M-RoPE per-token positions, shape (num_tokens, 3) on the wire.
+        # dim-0 is the sequence axis (matches hidden_states) so it rides the
+        # same SP gather / num_tokens slice / irecv path. dtype is int64,
+        # which differs from the bf16 hidden/residual, so the merge_payload
+        # sanity check below degrades merge_payload to False for VL models
+        # (one extra small P2P; acceptable, VL-only).
+        mrope_shape = (0, 3)
+        metadata_list.append(
+            ("mrope_positions", TensorMetadata(device, torch.int64, mrope_shape))
+        )
+        tensor_keys.append("mrope_positions")
+        send_tensor_keys.append("mrope_positions")
+
     # Decide whether to merge all tensors into one send/recv.  Conditions:
     #   1) at least 2 tensors to merge,
     #   2) all share the same dtype and same non-last-dim shape (the
@@ -142,14 +164,18 @@ def _build_edge_cloud_tensor_meta(
     # 2D, num_tokens x hc_mult for 3D) are preserved.
     from vllm_ascend import envs as envs_ascend
     env_enabled = envs_ascend.VLLM_ASCEND_EDGE_CLOUD_MERGE_PAYLOAD
+    send_keys_set = set(send_tensor_keys)
     merge_payload = env_enabled and len(tensor_keys) >= 2 and len(send_tensor_keys) >= 2
     merged_dtype: torch.dtype | None = None
     merged_shape_tail: tuple[int, ...] | None = None
     split_sizes: list[int] | None = None
+    merge_keys: list[str] = []
     if merge_payload:
-        # Sanity: all metadata entries that are TensorMetadata must agree on
-        # dtype and non-last-dim shape.  Different shape on the last dim is
-        # allowed (we are concatenating along dim=-1).
+        # Collect the homogeneous subset: keys that share the first tensor's
+        # dtype and non-last-dim shape. Heterogeneous keys (e.g. mrope_positions
+        # int64 vs bf16 hidden/residual) are simply skipped here instead of
+        # forcing the whole batch to no-merge, so hidden+residual still cat
+        # into one P2P and only the odd one out goes as a separate isend.
         first_meta = next(
             v for _, v in metadata_list if isinstance(v, TensorMetadata)
         )
@@ -157,19 +183,29 @@ def _build_edge_cloud_tensor_meta(
         leading_dims = first_meta.size[:-1]  # everything except hidden_size
         last_dim_sum = 0
         sizes: list[int] = []
-        for _, meta_v in metadata_list:
+        for key, meta_v in metadata_list:
             if not isinstance(meta_v, TensorMetadata):
                 continue
+            # Only keys actually on the wire can be merged; recv-only keys
+            # (e.g. the locally-zero-filled residual in embedding_only) are
+            # not sent so must not be in merge_keys.
+            if key not in send_keys_set:
+                continue
             if meta_v.dtype != merged_dtype or meta_v.size[:-1] != leading_dims:
-                # Heterogeneous, fall back to no merge.
-                merge_payload = False
-                merged_dtype = None
-                merged_shape_tail = None
-                sizes = []
-                break
+                # Heterogeneous: leave this key out of the merge group; it will
+                # be sent/received as an individual isend/irecv.
+                continue
+            merge_keys.append(key)
             sizes.append(meta_v.size[-1])
             last_dim_sum += meta_v.size[-1]
-        if merge_payload:
+        # Need at least 2 homogeneous keys for merging to save any RTT.
+        if len(merge_keys) < 2:
+            merge_payload = False
+            merged_dtype = None
+            merged_shape_tail = None
+            sizes = []
+            merge_keys = []
+        else:
             # leading_dims keeps the placeholder 0 in dim 0; the runtime
             # tensor will use the real num_tokens.  merged_shape_tail is the
             # part *after* dim 0, so we drop the leading 0.
@@ -185,6 +221,7 @@ def _build_edge_cloud_tensor_meta(
         merged_shape_tail=merged_shape_tail,
         split_sizes=split_sizes,
         send_tensor_keys=send_tensor_keys,
+        merge_keys=merge_keys,
     )
 
 
@@ -194,6 +231,7 @@ def init_edge_cloud_tensor_meta(
     has_residual: bool = True,
     hc_mult: int = 1,
     mode: str = "head_tail",
+    uses_mrope: bool = False,
     materialize_residual_boundary: bool = False,
 ):
     """Initialize the pre-computed tensor metadata for edge-cloud transfers.
@@ -257,9 +295,13 @@ def init_edge_cloud_tensor_meta(
 
     _EDGE_CLOUD_TENSOR_META_E2C = _build_edge_cloud_tensor_meta(
         hidden_size, hidden_dtype, e2c_recv_has_residual, e2c_send_has_residual, hc_mult,
+        uses_mrope=uses_mrope,
     )
     _EDGE_CLOUD_TENSOR_META_C2E = _build_edge_cloud_tensor_meta(
         hidden_size, hidden_dtype, c2e_recv_has_residual, c2e_send_has_residual, hc_mult,
+        # c2e (cloud->edge) does not need mrope: only edge computes M-RoPE
+        # and pushes it to cloud.
+        uses_mrope=False,
     )
     # Backward-compatible alias: dense (residual-carrying) meta.
     _EDGE_CLOUD_TENSOR_META = _EDGE_CLOUD_TENSOR_META_C2E
@@ -694,6 +736,7 @@ def edge_cloud_isend_tensor_dict(
     tensor_dict: dict[str, torch.Tensor | Any],
     dst: int | None = None,
     num_tokens: int | None = None,
+    include_mrope: bool = True,
 ) -> list[Handle]:
     """Send tensor dict without metadata sync (edge-cloud optimized).
 
@@ -719,6 +762,11 @@ def edge_cloud_isend_tensor_dict(
             etc.). When ``None``, tensors are sent as-is preserving the
             previous behavior for callers that already guarantee unpadded
             output.
+        include_mrope: when False, omit ``mrope_positions`` from the wire
+            payload (text-only batches compute M-RoPE locally on the cloud,
+            so transferring it would waste a P2P RTT). The caller on both
+            sides must pass the same value (derived from
+            step_has_multimodal_req) so sender/receiver agree on the key set.
     """
     pp_group = get_pp_group()
     if pp_group.world_size <= 1:
@@ -738,7 +786,15 @@ def edge_cloud_isend_tensor_dict(
     # mismatch would corrupt data silently or only surface as an HCCL
     # crash. Fail fast here with a precise message instead.
     ec_meta = _select_edge_cloud_meta_for_send()
-    send_keys = ec_meta.send_tensor_keys or ec_meta.tensor_keys
+    # Dynamic send key set: drop mrope_positions when the caller signals a
+    # text-only batch (include_mrope=False). Both sides derive include_mrope
+    # from the same step_has_multimodal_req(scheduler_output), so sender and
+    # receiver agree on whether mrope is on the wire.
+    meta_send_keys = ec_meta.send_tensor_keys or ec_meta.tensor_keys
+    send_keys = [
+        k for k in meta_send_keys
+        if not (k == "mrope_positions" and not include_mrope)
+    ]
     sender_tensor_keys = [
         k for k in send_keys
         if k in tensor_dict and isinstance(tensor_dict[k], torch.Tensor)
@@ -776,12 +832,13 @@ def edge_cloud_isend_tensor_dict(
     handles: list[Handle] = []
 
     if ec_meta.merge_payload:
-        # Fast path: concatenate all tensors along dim=-1 and send the
-        # merged buffer in a single isend.  Saves (N-1) HCCL P2P RTTs.
-        # Both sides must compute the same merged shape, which they do via
-        # the shared EdgeCloudTensorMeta initialized in worker setup.
+        # Fast path: concatenate the homogeneous subset (merge_keys, e.g.
+        # hidden_states + residual) along dim=-1 and send in a single isend.
+        # Heterogeneous keys (mrope_positions, int64) are NOT in merge_keys;
+        # they fall through to the per-key loop below as separate isends.
+        # Saves (|merge_keys| - 1) HCCL P2P RTTs vs sending each on its own.
         pieces: list[torch.Tensor] = []
-        for key in send_keys:
+        for key in ec_meta.merge_keys:
             value = tensor_dict[key]
             if not isinstance(value, torch.Tensor) or value.numel() == 0:
                 # The receiver expects every tensor key to contribute its
@@ -823,9 +880,13 @@ def edge_cloud_isend_tensor_dict(
         if merged.is_cuda:
             merged.record_stream(torch.cuda.current_stream(merged.device))
         handles.append(handle)
-        return handles
+        # Do NOT return: keys not in merge_keys (e.g. mrope_positions) still
+        # need to be sent as individual isends by the per-key loop below.
 
+    merged_key_set = set(ec_meta.merge_keys) if ec_meta.merge_payload else set()
     for key in send_keys:
+        if key in merged_key_set:
+            continue  # already sent inside the merged buffer above
         value = tensor_dict[key]
         if not isinstance(value, torch.Tensor):
             continue
@@ -898,9 +959,10 @@ def _split_merged_buffer_into_dict(
     non-contiguous strides.
     """
     assert ec_meta.split_sizes is not None
+    assert len(ec_meta.merge_keys) == len(ec_meta.split_sizes)
     out: dict[str, torch.Tensor] = {}
     offset = 0
-    for key, length in zip(ec_meta.tensor_keys, ec_meta.split_sizes):
+    for key, length in zip(ec_meta.merge_keys, ec_meta.split_sizes):
         sub = merged.narrow(-1, offset, length)
         if contiguous:
             sub = sub.contiguous()
@@ -931,6 +993,7 @@ def _pad_num_tokens_to_tp_multiple(num_tokens: int) -> int:
 def edge_cloud_irecv_tensor_dict(
     num_tokens: int,
     src: int | None = None,
+    include_mrope: bool = True,
 ) -> tuple[dict[str, torch.Tensor | Any], list[Handle], list[Callable[[], None]]]:
     """Receive tensor dict without metadata sync (edge-cloud optimized).
 
@@ -960,20 +1023,34 @@ def edge_cloud_irecv_tensor_dict(
     ec_meta = _select_edge_cloud_meta_for_recv()
     group = pp_group.device_group
 
+    tensor_dict: dict[str, Any] = {}
+    handles: list[Handle] = []
+    postprocess: list[Callable[[], None]] = []
+
+    # Non-tensor metadata entries are passed through unchanged (mirrors the
+    # original non-merge branch).
+    for key, value in ec_meta.metadata_list:
+        if not isinstance(value, TensorMetadata):
+            tensor_dict[key] = value
+
+    merge_key_set = set(ec_meta.merge_keys) if ec_meta.merge_payload else set()
+
     if ec_meta.merge_payload:
-        # Fast path: single irecv of the merged buffer, then split via
-        # narrow into per-key tensors.  The split is appended to the
-        # comm_postprocess list so it runs *after* the irecv handle is
-        # waited on by AsyncIntermediateTensors.wait_for_comm().
+        # Fast path for the homogeneous subset (merge_keys): single irecv of
+        # the merged buffer, then split via narrow into per-key tensors. The
+        # split is appended to comm_postprocess so it runs after the irecv
+        # handle is waited on by AsyncIntermediateTensors.wait_for_comm().
         merged = _allocate_merged_recv_buffer(ec_meta, num_tokens)
         # When SP is on, `merged` is padded up to a TP multiple; the sender
         # only transmits the actual num_tokens rows, so irecv into a view of
-        # the leading num_tokens rows (mirrors the non-merge SP path).  When
+        # the leading num_tokens rows (mirrors the non-merge SP path). When
         # SP is off this view is the whole buffer, a no-op.
         recv_view = merged[:num_tokens]
         handle = torch.distributed.irecv(
             recv_view, src=pp_group.ranks[src], group=group
         )
+        handles.append(handle)
+
         # Zero-fill the SP padding tail (see the non-merge path for why).
         # The merged buffer is TP-broadcast and split into per-key tensors,
         # so the tail padding flows into every per-key tensor; it must be
@@ -981,17 +1058,12 @@ def edge_cloud_irecv_tensor_dict(
         if merged.shape[0] > num_tokens:
             merged[num_tokens:].zero_()
 
-        # Pre-populate the dict with empty placeholders so callers can see
-        # the expected keys even before postprocess runs.  We replace them
-        # with the real (contiguous) views below.
-        tensor_dict: dict[str, Any] = {}
-        for key, value in ec_meta.metadata_list:
-            if not isinstance(value, TensorMetadata):
-                tensor_dict[key] = value
         # The split callback runs after irecv has populated `merged`.
-        def _split_into_dict() -> None:
+        def _split_into_dict(merged=merged) -> None:
             split = _split_merged_buffer_into_dict(merged, ec_meta)
             tensor_dict.update(split)
+
+        postprocess.append(_split_into_dict)
 
         # Stash the merged tensor on the dict (via a private key) so
         # edge_cloud_broadcast_recv can hand it to the TP broadcast path.
@@ -999,56 +1071,45 @@ def edge_cloud_irecv_tensor_dict(
         # never see it.
         tensor_dict["__merged_payload__"] = merged
 
-        return tensor_dict, [handle], [_split_into_dict]
-
-    tensor_dict: dict[str, Any] = {}
-    handles: list[Handle] = []
-    postprocess: list[Callable[[], None]] = []
-
     recv_num_tokens = _pad_num_tokens_to_tp_multiple(num_tokens)
     send_keys = set(ec_meta.send_tensor_keys or ec_meta.tensor_keys)
 
+    # Per-key irecv for keys NOT in the merge group (e.g. mrope_positions,
+    # int64), plus recv-only keys that the sender skips (zero residual in
+    # embedding_only). merge_keys were already handled by the merged buffer
+    # above and are skipped here.
     for key, value in ec_meta.metadata_list:
-        if isinstance(value, TensorMetadata):
-            # Replace the placeholder dim-0 with the TP-padded size; the
-            # actual wire transfer still only covers num_tokens rows.
-            full_size = (recv_num_tokens,) + value.size[1:]
-            full_tensor = torch.empty(
-                full_size, dtype=value.dtype, device=value.device
-            )
+        if not isinstance(value, TensorMetadata):
+            continue
+        if key in merge_key_set:
+            continue  # already covered by the merged buffer
+        if key == "mrope_positions" and not include_mrope:
+            # Sender omitted mrope for this text-only batch; do not allocate
+            # or irecv it (cloud computes M-RoPE locally).
+            continue
+        # Replace the placeholder dim-0 with the TP-padded size; the
+        # actual wire transfer still only covers num_tokens rows.
+        full_size = (recv_num_tokens,) + value.size[1:]
+        full_tensor = torch.empty(
+            full_size, dtype=value.dtype, device=value.device
+        )
 
-            if full_tensor.numel() == 0:
-                tensor_dict[key] = full_tensor
-                continue
-
-            if key in send_keys:
-                recv_view = full_tensor[:num_tokens]
-                handle = torch.distributed.irecv(
-                    recv_view, src=pp_group.ranks[src], group=group
-                )
-                handles.append(handle)
-                # Zero-fill the SP padding tail.  The sender only transmits
-                # the real num_tokens rows; the remaining
-                # (recv_num_tokens - num_tokens) rows are padding to satisfy
-                # SP's TP-divisibility and must be zero, not torch.empty's
-                # uninitialized memory.  Garbage here is read by downstream
-                # ops that iterate over the full TP-padded buffer (SP
-                # all-gather inside attention, DSA compression, hc_head/norm)
-                # and probabilistically corrupts batched requests on 3D
-                # (DeepSeek V4) models.  Runs on the compute stream
-                # concurrent with the HCCL irecv (disjoint regions); the
-                # irecv handle wait plus the next HCCL op's compute->HCCL
-                # sync make it visible before any read.
-                if recv_num_tokens > num_tokens:
-                    full_tensor[num_tokens:].zero_()
-            else:
-                # The sender skipped this tensor (e.g. the zero residual in
-                # embedding_only e2c). Keep the buffer zeroed so the model
-                # layers see a valid residual without paying cross-node cost.
-                full_tensor.zero_()
+        if full_tensor.numel() == 0:
             tensor_dict[key] = full_tensor
+            continue
+
+        if key in send_keys:
+            recv_view = full_tensor[:num_tokens]
+            handle = torch.distributed.irecv(
+                recv_view, src=pp_group.ranks[src], group=group
+            )
+            handles.append(handle)
         else:
-            tensor_dict[key] = value
+            # The sender skipped this tensor (e.g. the zero residual in
+            # embedding_only e2c). Keep the buffer zeroed so the model
+            # layers see a valid residual without paying cross-node cost.
+            full_tensor.zero_()
+        tensor_dict[key] = full_tensor
 
     return tensor_dict, handles, postprocess
 
@@ -1071,10 +1132,42 @@ def _apply_sp_chunk_inplace(tensor_dict: dict[str, Any]) -> None:
             tensor_dict[key] = sequence_parallel_chunk(value)
 
 
+def _broadcast_nonmerge_tensors_inplace(
+    tensor_dict: dict[str, Any],
+    ec_meta: "EdgeCloudTensorMeta",
+    tp_group: Any,
+) -> None:
+    """Broadcast/recv the non-merge-group tensors across the local TP group.
+
+    On the merge path only the merged buffer (covering ``merge_keys``) is
+    TP-broadcast by ``edge_cloud_broadcast_recv``'s broadcast_postprocess.
+    Keys that are NOT in ``merge_keys`` (e.g. mrope_positions, int64) were
+    irecv'd by PP NPU0 only and still need an intra-node broadcast so the
+    other TP ranks see them. This mirrors the non-merge path's per-tensor
+    broadcast, scoped to the non-merge keys.
+    """
+    merge_key_set = set(ec_meta.merge_keys) if ec_meta.merge_payload else set()
+    handles = []
+    for key, tensor in tensor_dict.items():
+        if key in merge_key_set or key == "__merged_payload__":
+            continue
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            continue
+        group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+        handles.append(
+            torch.distributed.broadcast(
+                tensor, src=tp_group.ranks[0], group=group, async_op=True
+            )
+        )
+    for handle in handles:
+        handle.wait()
+
+
 def edge_cloud_broadcast_recv(
     num_tokens: int,
     sp_chunk: bool = False,
     src: int | None = None,
+    include_mrope: bool = True,
 ) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
@@ -1101,6 +1194,10 @@ def edge_cloud_broadcast_recv(
             the local PP group is the PP pair (i.e. it participates
             in the PP receive); the singleton-PP TP-broadcast-only
             branch is unchanged.
+
+    include_mrope: must match the sender's edge_cloud_isend_tensor_dict
+    argument (both derived from step_has_multimodal_req). When False,
+    mrope_positions is neither received nor broadcast (text-only batch).
     """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
@@ -1113,6 +1210,7 @@ def edge_cloud_broadcast_recv(
         tensor_dict, comm_handles, comm_postprocess = edge_cloud_irecv_tensor_dict(
             num_tokens=num_tokens,
             src=src,
+            include_mrope=include_mrope,
         )
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv: PP tensor_dict is None, "
@@ -1148,6 +1246,11 @@ def edge_cloud_broadcast_recv(
                 tensor_dict.update(
                     _split_merged_buffer_into_dict(merged_buf, ec_meta)
                 )
+                # Non-merge keys (e.g. mrope_positions) were irecv'd into
+                # tensor_dict above but are NOT inside merged_buf, so the
+                # merged broadcast did not deliver them to the other TP ranks.
+                # Broadcast them individually here (intra-node, cheap).
+                _broadcast_nonmerge_tensors_inplace(tensor_dict, ec_meta, tp_group)
 
             comm_postprocess.append(broadcast_postprocess)
             # On the merge path the per-key tensors are materialized lazily
@@ -1196,6 +1299,24 @@ def edge_cloud_broadcast_recv(
             for key, value in ec_meta.metadata_list
             if not isinstance(value, TensorMetadata)
         }
+        # Non-merge keys (e.g. mrope_positions) are NOT inside merged_buf, so
+        # allocate per-key buffers matching PP NPU0's and broadcast-recv them
+        # individually alongside the merged buffer.
+        merge_key_set = set(ec_meta.merge_keys)
+        recv_num_tokens = _pad_num_tokens_to_tp_multiple(num_tokens)
+        for key, value in ec_meta.metadata_list:
+            if not isinstance(value, TensorMetadata):
+                continue
+            if key in merge_key_set:
+                continue  # covered by merged_buf
+            if key == "mrope_positions" and not include_mrope:
+                # Sender omitted mrope for this text-only batch; mirror that
+                # on the recv side (do not allocate / broadcast-recv).
+                continue
+            full_size = (recv_num_tokens,) + value.size[1:]
+            recv_tensor_dict[key] = torch.empty(
+                full_size, dtype=value.dtype, device=value.device
+            )
 
         def broadcast_postprocess(
             merged_buf=merged_buf,
@@ -1212,6 +1333,8 @@ def edge_cloud_broadcast_recv(
             recv_tensor_dict.update(
                 _split_merged_buffer_into_dict(merged_buf, ec_meta)
             )
+            # Broadcast-recv the non-merge keys (mirrors PP NPU0's broadcast).
+            _broadcast_nonmerge_tensors_inplace(recv_tensor_dict, ec_meta, tp_group)
 
         postprocess: list[Callable[[], None]] = [broadcast_postprocess]
         if sp_chunk:
@@ -1229,6 +1352,9 @@ def edge_cloud_broadcast_recv(
 
     for key, value in metadata_list:
         if isinstance(value, TensorMetadata):
+            if key == "mrope_positions" and not include_mrope:
+                # Sender omitted mrope for this text-only batch; skip.
+                continue
             # Replace placeholder dim-0 with the TP-padded size so the
             # intra-node broadcast matches the tensor allocated by PP NPU0.
             full_size = (recv_num_tokens,) + value.size[1:]

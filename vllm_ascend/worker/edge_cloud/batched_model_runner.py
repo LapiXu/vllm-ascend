@@ -835,14 +835,7 @@ class BatchedModelRunner(NPUModelRunner):
         that the cloud's pre-allocated buffer is large enough.
         """
         # Per-bundle actual (non-padded) token counts.
-        n_actuals = [
-            (b.attn_metadata[0][
-                next(iter(b.attn_metadata[0]))].num_actual_tokens
-             if isinstance(b.attn_metadata, list) and b.attn_metadata
-             else next(iter(b.attn_metadata.values()))
-             .num_actual_tokens)
-            for b in bundles
-        ]
+        n_actuals = [b.num_actual_tokens for b in bundles]
 
         num_tokens_merged = sum(n_actuals)
         num_tokens_across_dp_merged = None
@@ -965,14 +958,7 @@ class BatchedModelRunner(NPUModelRunner):
         """
         # Per-bundle actual token counts (defensive trim of the
         # cloud-returned intermediates).
-        n_actuals_tail = [
-            (b.attn_metadata[0][
-                next(iter(b.attn_metadata[0]))].num_actual_tokens
-             if isinstance(b.attn_metadata, list) and b.attn_metadata
-             else next(iter(b.attn_metadata.values()))
-             .num_actual_tokens)
-            for b in bundles
-        ]
+        n_actuals_tail = [b.num_actual_tokens for b in bundles]
         if all(it["hidden_states"] is not None
                for it in intermediates):
             merged_hidden = torch.cat(
@@ -1257,15 +1243,7 @@ class BatchedModelRunner(NPUModelRunner):
             num_tokens_padded_merged = (
                 merged_batch_descriptor.num_tokens)
 
-        def _actual_tokens(b: "_ExecuteModelBundle") -> int:
-            md = b.attn_metadata
-            if isinstance(md, list):
-                md = md[0][next(iter(md[0]))]
-            else:
-                md = next(iter(md.values()))
-            return md.num_actual_tokens
-
-        n_actuals = [_actual_tokens(b) for b in bundles]
+        n_actuals = [b.num_actual_tokens for b in bundles]
         if all(b.input_ids is not None for b in bundles):
             merged_input_ids_ctx = torch.cat(
                 [b.input_ids[:n]

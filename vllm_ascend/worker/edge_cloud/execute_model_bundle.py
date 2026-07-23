@@ -100,6 +100,17 @@ class _ExecuteModelBundle:
     # Pre-stage side effects (from ``_update_states``)
     deferred_state_corrections_fn: Callable[[], None] | None
 
+    @property
+    def num_actual_tokens(self) -> int:
+        """Return the unpadded token count for this scheduler step.
+
+        ``attn_metadata`` can legitimately be empty on an embedding-only
+        edge because that segment contains no attention layers. The scheduler
+        output remains available in every mode and is the authoritative source
+        for the number of scheduled, non-padded tokens.
+        """
+        return self.scheduler_output.total_num_scheduled_tokens
+
 
 @dataclass
 class _MergedAttnContext:

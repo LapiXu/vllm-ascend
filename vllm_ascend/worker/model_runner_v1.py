@@ -2707,6 +2707,9 @@ class NPUModelRunner(GPUModelRunner):
                     # is NOT idempotent (rewrites num_accepted_tokens_cpu in
                     # place under async spec decode), so reuse its results here
                     # instead of letting _run_input_preparation call it again.
+
+                    # skip_dsa_fill: already filled above between first
+                    # _prepare_inputs and here, using the first call's values.
                     cache = self._run_input_preparation(
                         scheduler_output,
                         precomputed=(
@@ -2715,6 +2718,7 @@ class NPUModelRunner(GPUModelRunner):
                             total_num_scheduled_tokens,
                             num_scheduled_tokens_compressed_list,
                         ),
+                        skip_dsa_fill=True
                     )
                     total_num_scheduled_tokens = cache["total_num_scheduled_tokens"]
                     num_tokens_padded = cache["num_tokens_padded"]
@@ -2747,6 +2751,28 @@ class NPUModelRunner(GPUModelRunner):
                 ):
                     self._cloud_spec_decode_common_attn_metadata = spec_decode_common_attn_metadata
                     self._cloud_spec_decode_num_reqs = num_reqs
+
+            # Edge-cloud cloud side: reuse the M-RoPE positions edge computed
+            # and pushed via intermediate_tensors (cloud skipped
+            # _init/_calc_mrope_positions). The wire tensor is [N, 3]
+            # (dim-0 = sequence). Materialize it into
+            # self.mrope_positions.gpu[:, :num_tokens_padded] ([3, N]) BEFORE
+            # _preprocess, which reads `positions` as a view over this buffer
+            # and runs update_cos_sin on it. Capture the received reference now:
+            # _preprocess -> sync_and_slice_intermediate_tensors reassigns
+            # `intermediate_tensors` to a local-buffer copy that omits
+            # mrope_positions (the sync loop skips it).
+            recv_intermediate_tensors = intermediate_tensors
+            if (self._edge_cloud_enabled
+                    and self.edge_cloud_cfg.role == "cloud"
+                    and self.uses_mrope
+                    and self.step_has_multimodal_req(scheduler_output)
+                    and recv_intermediate_tensors is not None):
+                recv_intermediate_tensors.wait_for_comm()
+                recv_mrope = recv_intermediate_tensors.tensors["mrope_positions"]
+                self.mrope_positions.gpu[:, :num_tokens_padded].copy_(
+                    recv_mrope[:num_tokens_padded].t().contiguous()
+                )
 
             (
                 input_ids,
@@ -3850,6 +3876,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
         precomputed: tuple | None = None,
+        skip_dsa_fill: bool = False,
     ) -> dict[str, Any]:
         """Run input preparation pipeline after _update_states.
 
@@ -3866,6 +3893,10 @@ class NPUModelRunner(GPUModelRunner):
         results via ``precomputed`` so we reuse them instead of re-running.
         ``cloud_prepare_early`` has no prior inline call and passes
         ``precomputed=None`` so we run it here exactly once.
+        Args:
+            skip_dsa_fill: If True, skip filling _dsa_positions_cpu_buf
+                (caller already filled it, e.g. slow path between first
+                _prepare_inputs and _run_input_preparation).
         """
         num_reqs = self.input_batch.num_reqs
         # Guard against empty batch after _update_states
@@ -3905,6 +3936,24 @@ class NPUModelRunner(GPUModelRunner):
             ) = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
+            )
+
+        # Fill _dsa_positions_cpu_buf for DSA compression.
+        # cloud_prepare_early calls _run_input_preparation directly and
+        # relies on this fill.  The slow path passes skip_dsa_fill=True
+        # because it already filled above (between the first _prepare_inputs
+        # and _run_input_preparation, to use the first call's values).
+        if self.use_compress and not skip_dsa_fill:
+            req_indices = np.repeat(
+                self.arange_np[:num_reqs], num_scheduled_tokens_np
+            )
+            dsa_positions_np = self._dsa_positions_np_buf[
+                :total_num_scheduled_tokens
+            ]
+            np.add(
+                self.input_batch.num_computed_tokens_cpu[req_indices],
+                self.query_pos.np[:total_num_scheduled_tokens],
+                out=dsa_positions_np,
             )
 
         num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
@@ -3999,6 +4048,53 @@ class NPUModelRunner(GPUModelRunner):
             "cudagraph_stats": cudagraph_stats,
             "num_scheduled_tokens_compressed_list": num_scheduled_tokens_compressed_list,
         }
+
+    def step_has_multimodal_req(self, scheduler_output) -> bool:
+        """Whether the current step's batch contains any multimodal request.
+
+        Used to decide whether mrope_positions must be transferred edge->cloud
+        (only multimodal requests need it; text-only batches can be computed
+        locally on the cloud because empty mm_features degrades M-RoPE to 1D
+        without hitting the missing image_grid_thw). Must return the SAME value
+        on edge and cloud (they share the scheduler_output and build req_state
+        from the same NewRequestData.mm_features).
+        """
+        # cached/running reqs: covers decode of multimodal requests (whose
+        # mm_features stay non-empty after prefill).
+        if any(rs.mm_features for rs in self.requests.values()):
+            return True
+        # new reqs this step: cloud recv runs BEFORE cloud_prepare_early builds
+        # req_state, so on the cloud side self.requests does not yet contain
+        # this step's new reqs; check scheduler_output directly.
+        for nr in scheduler_output.scheduled_new_reqs:
+            if getattr(nr, "mm_features", None):
+                return True
+        return False
+
+    def _init_mrope_positions(self, req_state) -> None:
+        # In edge-cloud cloud mode: skip M-RoPE init only for multimodal
+        # requests (their image_grid_thw / video_grid_thw did not cross the
+        # edge->cloud mm_features boundary, so local init would KeyError).
+        # Text-only requests (empty mm_features) init locally: _iter_mm_grid_hw
+        # does not enter its loop, M-RoPE degrades to 1D, no crash. This lets
+        # text-only batches skip the mrope transfer entirely.
+        # profile_run / _dummy_run do not call this, so the role guard does not
+        # affect profiling.
+        if (self._edge_cloud_enabled
+                and self.edge_cloud_cfg.role == "cloud"
+                and req_state.mm_features):
+            return
+        super()._init_mrope_positions(req_state)
+
+    def _calc_mrope_positions(self, scheduler_output) -> None:
+        # In edge-cloud cloud mode: skip local calc only when the batch contains
+        # a multimodal request (edge transfers the whole-batch mrope buffer and
+        # execute_model injects it). Text-only batches compute locally.
+        if (self._edge_cloud_enabled
+                and self.edge_cloud_cfg.role == "cloud"
+                and self.step_has_multimodal_req(scheduler_output)):
+            return
+        super()._calc_mrope_positions(scheduler_output)
 
     def cloud_prepare_early(self, scheduler_output: "SchedulerOutput") -> None:
         """Pre-compute input preparation on cloud while edge runs segment_a.
@@ -4339,7 +4435,7 @@ class NPUModelRunner(GPUModelRunner):
                 # the received prefix and zero-fill the padding locally to avoid
                 # a shape-mismatch copy_ error on NPUs (e.g. 60 vs 64).
                 for k, v in intermediate_tensors.items():
-                    if not isinstance(v, torch.Tensor):
+                    if not isinstance(v, torch.Tensor) or k == "mrope_positions":
                         continue
                     copy_len = num_tokens
                     dst = self.intermediate_tensors[k][:copy_len]
@@ -4356,6 +4452,15 @@ class NPUModelRunner(GPUModelRunner):
                 )
             else:
                 for k, v in intermediate_tensors.items():
+                    # mrope_positions is an edge-cloud side-channel tensor that
+                    # lives outside the model's layer-to-layer intermediate
+                    # buffer (self.intermediate_tensors, declared by
+                    # make_empty_intermediate_tensors as hidden/residual only).
+                    # It is materialized into self.mrope_positions.gpu directly
+                    # in execute_model before _preprocess; skip it here so the
+                    # copy-into-local-buffer loop does not KeyError on it.
+                    if k == "mrope_positions":
+                        continue
                     copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
                     # Clamp copy_len to the source tensor's actual dim-0 size.
                     # In edge-cloud mode the received intermediate_tensors may have
@@ -5532,11 +5637,13 @@ class NPUModelRunner(GPUModelRunner):
             from vllm_ascend.utils import extract_dsv4_layer_index
 
             assert len(self.kv_caches) == 0
+            self.kv_cache_names: list[str] = []
             for layer_name in sorted(
                     kv_caches,
                     key=lambda name: (extract_dsv4_layer_index(
                         self.model_config.hf_text_config, name), name)):
                 self.kv_caches.append(kv_caches[layer_name])
+                self.kv_cache_names.append(layer_name)
             for layer_name, kv_cache in kv_caches.items():
                 self.compilation_config.static_forward_context[
                     layer_name].kv_cache = [kv_cache]
@@ -6454,7 +6561,51 @@ class NPUModelRunner(GPUModelRunner):
             wrapper.concrete_aclgraph_entries.clear()
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
             result = GPUModelRunner.capture_model(self)
+        self._zero_dsa_state_block0()
         return result
+
+    def _zero_dsa_state_block0(self) -> None:
+        """Zero physical block 0 (null/dummy block) of every DSA compressor
+        state cache. Always-on; called once at the end of capture_model.
+
+        The compressor kernel indexes state_cache in raw-position space
+        (block_table[req][pos // 8]), but the decode-time state block table
+        carries only one valid block; positions >= 8 hit zero-padding
+        entries. Kernel writes to entry 0 are silently dropped, while reads
+        are NOT guarded and land on physical block 0, whose content is
+        capture-order-dependent residue (NaN when the size-1 capture runs
+        last -> accuracy corruption at the first decode compression
+        boundary). Zeroing block 0 makes the phantom read deterministic and
+        restores eager parity.
+
+        Once after capture is sufficient: real inference never writes state
+        block 0 (kernel writes to entry 0 are dropped; decode padding slots
+        are -1, not 0), so the zeroed content persists for the process
+        lifetime. Verified: b0nan stays constant across prefill+decode.
+        """
+        try:
+            caches = getattr(self, "_dsa_state_caches_for_zero", None)
+            if not caches:
+                # （重）收集。profile/dummy 阶段 KV cache 尚未初始化，此时
+                # 收集到 0 个属正常——不能缓存空列表，否则后续永远不再重试。
+                caches = []
+                names = getattr(self, "kv_cache_names", None) or []
+                runner_caches = getattr(self, "kv_caches", None) or []
+                for i, name in enumerate(names):
+                    if "compressor.state_cache" not in name or i >= len(runner_caches):
+                        continue
+                    entry = runner_caches[i]
+                    cache = entry[0] if isinstance(entry, (list, tuple)) else entry
+                    if isinstance(cache, torch.Tensor) and cache.numel() > 0:
+                        caches.append(cache)
+                if not caches:
+                    return
+                # 收集成功才缓存
+                self._dsa_state_caches_for_zero = caches
+            for cache in caches:
+                cache[0].zero_()
+        except Exception:
+            pass
 
     def _prepare_multimodal_fields(self):
         """

@@ -47,6 +47,7 @@ from vllm.sequence import IntermediateTensors
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+    from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
 
 @dataclass
@@ -81,13 +82,66 @@ class _ExecuteModelBundle:
     spec_decode_common_attn_metadata: Any | None
     scheduler_output: "SchedulerOutput"
 
-    # Per-dp_rank attention metadata. The merged-attn ctx builder
-    # reads ``num_reqs`` / ``query_start_loc`` / ``seq_lens`` /
-    # ``max_query_len`` / ``max_seq_len`` from this object directly
-    # (they're already exposed as fields on
-    # ``AscendCommonAttentionMetadata``), so we don't duplicate them
-    # at the bundle level.
+    # Per-dp_rank attention metadata — the *output* of
+    # ``_build_attention_metadata`` for this dp_rank (an
+    # ``AscendMetadata`` / ``GDNAttentionMetadata`` dataclass per
+    # layer). The merged-attn ctx builder does NOT read derived
+    # fields from this object (``num_prefills`` / ``num_decodes`` /
+    # ``attn_state`` / ``actual_seq_lengths_q`` / ``attn_mask`` /
+    # ``causal`` / ``model_runner_type`` etc.) — those are recomputed
+    # in the batched merge step from the raw fields below. The
+    # dataclass is kept here only for
+    # ``execute_model_post_batched`` (per-dp_rank post, which writes
+    # ``ExecuteModelState.attn_metadata``).
     attn_metadata: Any
+
+    # Actual per-dp_rank request count (NOT the cudagraph-padded
+    # ``num_reqs_padded`` stored in ``common_attn_metadata.num_reqs``).
+    # The batched merge step uses this as the upper bound when
+    # un-padding the per-req cm fields via
+    # ``common_attn_metadata.unpadded(num_actual_tokens,
+    # num_reqs_actual)`` so the merged tensor carries only real data
+    # (the padded tail — filled with 0 / False by
+    # ``_build_attention_metadata`` — would otherwise be cat'd as
+    # if it were real). Sourced from
+    # ``self.input_batch.num_reqs`` in ``execute_model_pre``.
+    num_reqs_actual: int
+
+    # Per-dp_rank ``AscendCommonAttentionMetadata`` (the
+    # ``cm_base`` already produced by
+    # ``NPUModelRunner._build_attention_metadata``). gid=0's
+    # ``block_table_tensor`` / ``slot_mapping`` (and any other
+    # gid-0-specific fields) live HERE — ``_save`` only writes
+    # overrides to ``self.per_gid_cm`` for ``kv_cache_gid > 0``
+    # (see ``_build_attention_metadata`` lines ~4543–4547), so
+    # there is no duplication with ``per_gid_cm``.
+    # The batched merge step shallow-copies this object, then
+    # per-(kv_cache_gid, attn_gid) applies the matching
+    # ``per_gid_cm[kv_cache_gid]`` before calling
+    # ``builder.build(common_attn_metadata=cm)``.
+    common_attn_metadata: "AscendCommonAttentionMetadata"
+    # Per-kv_cache_gid override dicts. Each entry is the
+    # ``self.per_gid_cm[kv_cache_gid]`` saved by
+    # ``_save('encoder_seq_lens')`` /
+    # ``_save('encoder_seq_lens_cpu')`` /
+    # ``_save('query_start_loc')`` /
+    # ``_save('query_start_loc_cpu')`` (GDN-only) /
+    # ``_save('block_table_tensor')`` /
+    # ``_save('slot_mapping')`` calls in
+    # ``_build_attention_metadata``. Length
+    # ``== len(self.kv_cache_config.kv_cache_groups)``.
+    # The merge step applies the dict on top of a shallow
+    # ``copy(common_attn_metadata)`` to produce the per-gid cm
+    # the builder consumes.
+    per_gid_cm: list[dict[str, Any]]   # len=num_kv_cache_gids
+    # Per-(kv_cache_gid, attn_gid) ``(cascade_attn_prefix_len,
+    # extra_attn_metadata_args)`` tuple saved by
+    # ``_build_attn_group_metadata`` for batched-path
+    # consumption. Keyed by ``(kv_cache_gid, attn_gid)``.
+    # ``extra_attn_metadata_args`` is the FINAL state after
+    # both GDN and DSA branches have populated it (the save
+    # is placed AFTER all assignments).
+    per_gid_extra: dict[tuple[int, int], tuple[int, dict[str, Any]]]
 
     # Forward-context fields
     num_tokens_padded: int
@@ -158,7 +212,44 @@ class _MergedAttnContext:
 
     merged_attn_metadata: Any
     merged_batch_descriptor: Any
+    merged_cudagraph_mode: "CUDAGraphMode"
     num_tokens_padded_merged: int
     merged_input_ids: torch.Tensor | None
     merged_positions: torch.Tensor | None
     merged_inputs_embeds: torch.Tensor | None
+
+    # Decode-first reorder state.
+    #
+    # The batched merge cat's per-req fields in the order of
+    # ``bundles`` (== ``batched_dp_ranks`` order). Many attention
+    # builders (notably ``GDNAttentionMetadataBuilder``) call
+    # ``split_decodes_and_prefills`` which assumes the batch is
+    # already in decode-first order
+    # (``first_prefill = argmax(is_prefill)`` gives ``num_decodes``
+    # directly). Per-dp_rank ``_may_reorder_batch`` only sorts
+    # INSIDE a single dp_rank; the merged batch still needs a
+    # global decode-first reorder so the attention kernel's
+    # decode/prefill split matches the merged layout.
+    #
+    # Both perm tensors are ``None`` iff the merged batch is
+    # decode-only (``merged_attn_state == DecodeOnly``) and the
+    # reorder is a no-op — in that case the cat-order layout
+    # IS the decode-first layout, so the head/tail stages skip
+    # every per-token permute / un-permute work below.
+    # Otherwise ``merged_token_perm`` has shape
+    # ``[merged_num_actual_tokens]`` (CPU int64) and maps a
+    # cat-order token index to its reordered position; used by
+    # the tail stage to rewrite ``merged_logits_indices`` so
+    # that ``merged_sample_hidden_states = hidden_states[indices]``
+    # still picks the right rows after the per-token reorder.
+    merged_token_perm: torch.Tensor | None
+    # ``None`` when ``merged_token_perm`` is ``None``;
+    # otherwise shape ``[merged_num_actual_tokens]`` (CPU int64)
+    # mapping a reordered token index back to its cat-order
+    # index. Used by tail stage to un-permute ``merged_hidden``
+    # so the worker can slice per-dp_rank with the original
+    # cat-order ``token_offsets`` and feed
+    # ``execute_model_post_batched`` with a tensor in the same
+    # per-dp_rank local layout that ``bundle[i].logits_indices``
+    # expects.
+    inv_merged_token_perm: torch.Tensor | None

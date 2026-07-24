@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import time
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -45,7 +45,7 @@ from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -68,28 +68,6 @@ if TYPE_CHECKING:
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
-
-
-@dataclass
-class _StubCommonAttnMetadata:
-    """Minimal stub carrying the fields the GDN sub-patchers
-    (``_patched_build_spec`` / ``_patched_build_prefill`` /
-    ``_patched_build_decode``) read off
-    ``common_attn_metadata``.
-
-    Used by ``BatchedModelRunner._merge_gdn_layer_attn`` to feed the
-    patched builders when running the batched GDN path. Only
-    ``query_start_loc`` (for ``.device``) and
-    ``query_start_loc_cpu`` (the merged full cu_seqlen) plus
-    ``num_decode_draft_tokens_cpu`` (the merged per-req spec flag)
-    are needed; the rest of
-    :class:`vllm.v1.attention.backend.CommonAttentionMetadata` is not
-    read.
-    """
-
-    query_start_loc: torch.Tensor
-    query_start_loc_cpu: torch.Tensor
-    num_decode_draft_tokens_cpu: torch.Tensor | None = None
 
 
 class BatchedModelRunner(NPUModelRunner):
@@ -115,12 +93,16 @@ class BatchedModelRunner(NPUModelRunner):
       :meth:`execute_model_batched_head` / ``_tail`` (single-shot
       merged forward + ``compute_logits``),
       :meth:`execute_model_post_batched` (per-dp_rank state write).
-    - Adds the merged-attn helpers :meth:`_get_or_build_merged_attn_ctx`,
-      :meth:`_merge_layer_attn` (per-layer ``AscendMetadata``),
-      :meth:`_merge_gdn_layer_attn` (per-layer
-      ``GDNAttentionMetadata``) plus the per-layer routing helpers
-      :meth:`_get_bpb_for_layer` / :meth:`_is_c8_attn_layer` and the
-      global-buffer allocator :meth:`_allocate_global_kv_cache_tensors`.
+    - Adds the merged-attn helper :meth:`_get_or_build_merged_attn_ctx`
+      that builds a merged ``AscendCommonAttentionMetadata`` from
+      the per-dp_rank ``_ExecuteModelBundle``s and feeds it back
+      into each per-(kv_cache_gid, attn_gid) builder (the per-layer
+      ``AscendMetadata`` / ``GDNAttentionMetadata`` is produced by
+      the builder itself — no per-layer manual merge logic). Also
+      adds the per-layer routing helpers
+      :meth:`_get_bpb_for_layer` / :meth:`_is_c8_attn_layer` and
+      the global-buffer allocator
+      :meth:`_allocate_global_kv_cache_tensors`.
 
     The original :class:`NPUModelRunner` is unchanged. Use this class
     in place of :class:`NPUModelRunner` when constructing the shared-
@@ -551,9 +533,36 @@ class BatchedModelRunner(NPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
 
+    def _should_save_for_attn_metadata(self) -> bool:
+        return True
+
+    def _sync_metadata_across_dp(
+        self,
+        num_tokens: int,
+        is_draft_model: bool = False,
+        cudagraph_mode: "CUDAGraphMode" = CUDAGraphMode.NONE,
+        allow_dp_padding: bool = False,
+    ) -> tuple[int, None, "CUDAGraphMode"]:
+        """No-op for the shared-model edge path.
+
+        The base implementation calls ``dist.all_reduce`` to
+        coordinate ``num_tokens`` / ``cudagraph_mode`` across
+        the DP group. On the shared-model edge every
+        ``dp_rank`` lives in the SAME process / SAME NPU; there
+        is no distributed DP group, and the cross-dp
+        coordination that the upstream code expects (uniform
+        ``num_tokens`` / ``cudagraph_mode``) is performed
+        instead by the leader runner's
+        ``_get_or_build_merged_attn_ctx`` /
+        ``cudagraph_dispatcher.dispatch`` over the per-dp_rank
+        bundles. Return the caller's own values so the
+        downstream flow proceeds unchanged.
+        """
+        return num_tokens, None, cudagraph_mode
     # ------------------------------------------------------------------
     # Batched compute entry points
     # ------------------------------------------------------------------
+    @torch.inference_mode()
     def execute_model_pre(
         self,
         scheduler_output: "SchedulerOutput",
@@ -795,6 +804,42 @@ class BatchedModelRunner(NPUModelRunner):
                 generators=self.input_batch.sampling_metadata.generators,
             )
 
+        # Re-bundle the per-dp_rank attention state that
+        # ``_build_attention_metadata`` already saved to ``self.*``
+        # (via ``_should_save_for_attn_metadata()=True``): the
+        # ``self.cm_base`` ``AscendCommonAttentionMetadata``
+        # directly, plus a list of per-kv_cache_gid override
+        # dicts (``self.per_gid_cm[kv_cache_gid]`` — exactly what
+        # ``_save`` wrote for each gid: ``encoder_seq_lens`` /
+        # ``encoder_seq_lens_cpu`` / GDN's ``query_start_loc(_cpu)``
+        # / gid>0's ``block_table_tensor`` / ``slot_mapping``),
+        # plus the per-(kv_cache_gid, attn_gid) ``(cascade_attn_prefix_len,
+        # extra_attn_metadata_args)`` tuple saved by
+        # ``_build_attn_group_metadata``. The batched merge step
+        # re-uses these structures verbatim — it never re-extracts
+        # the raw fields.
+        # ---- guard the async GPU->CPU copy (matches
+        # ``_build_attention_metadata``) ----
+        cm_base = getattr(self, "cm_base", None)
+        if cm_base is None:
+            raise RuntimeError(
+                "BatchedModelRunner.execute_model_pre expected "
+                "self.cm_base to be saved by _build_attention_metadata "
+                "(via _should_save_for_attn_metadata=True).")
+        per_gid_cm = getattr(self, "per_gid_cm", None)
+        if per_gid_cm is None:
+            raise RuntimeError(
+                "BatchedModelRunner.execute_model_pre expected "
+                "self.per_gid_cm to be saved by _build_attention_metadata.")
+        per_gid_extra = getattr(self, "per_gid_extra", None)
+        if per_gid_extra is None:
+            raise RuntimeError(
+                "BatchedModelRunner.execute_model_pre expected "
+                "self.per_gid_extra to be saved by "
+                "_build_attn_group_metadata (via "
+                "_should_save_for_attn_metadata=True).")
+        common_attn_metadata = cm_base
+
         return _ExecuteModelBundle(
             input_ids=input_ids,
             positions=positions,
@@ -811,12 +856,17 @@ class BatchedModelRunner(NPUModelRunner):
             cudagraph_mode=cudagraph_mode,
             batch_desc=batch_desc,
             attn_metadata=attn_metadata,
+            num_reqs_actual=self.input_batch.num_reqs,
+            common_attn_metadata=common_attn_metadata,
+            per_gid_cm=per_gid_cm,
+            per_gid_extra=per_gid_extra,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=cudagraph_stats,
             deferred_state_corrections_fn=(
                 deferred_state_corrections_fn),
         )
 
+    @torch.inference_mode()
     def execute_model_batched_head(
         self,
         bundles: list[_ExecuteModelBundle],
@@ -853,13 +903,23 @@ class BatchedModelRunner(NPUModelRunner):
                 bundles, batched_dp_ranks)
             head_attn_metadata: Any = ctx.merged_attn_metadata
             batch_descriptor = ctx.merged_batch_descriptor
+            cudagraph_mode = ctx.merged_cudagraph_mode
             num_tokens_padded_merged = ctx.num_tokens_padded_merged
             merged_input_ids = ctx.merged_input_ids
             merged_positions = ctx.merged_positions
             merged_inputs_embeds = ctx.merged_inputs_embeds
+            # Capture the inverse token perm so we can un-permute
+            # the head ``_model_forward`` output (which is in
+            # reordered decode-first layout) back to cat-order
+            # before slicing per-dp_rank. The cloud middle forward
+            # consumes the head's hidden_states with its own
+            # per-dp_rank ``query_lens`` (in cat-order); reordered
+            # hidden_states would mis-align with those query_lens.
+            inv_merged_token_perm = ctx.inv_merged_token_perm
         else:
             head_attn_metadata = any_bundle.attn_metadata
             batch_descriptor = any_bundle.batch_desc
+            cudagraph_mode = any_bundle.cudagraph_mode
             num_tokens_padded_merged = sum(
                 b.num_tokens_padded for b in bundles)
             if all(b.input_ids is not None for b in bundles):
@@ -882,6 +942,7 @@ class BatchedModelRunner(NPUModelRunner):
                      for b, n in zip(bundles, n_actuals)])
             else:
                 merged_inputs_embeds = None
+            inv_merged_token_perm = None
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -889,7 +950,7 @@ class BatchedModelRunner(NPUModelRunner):
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens_padded_merged,
                 num_tokens_across_dp=num_tokens_across_dp_merged,
-                aclgraph_runtime_mode=any_bundle.cudagraph_mode,
+                aclgraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_descriptor,
                 num_actual_tokens=num_tokens_merged,
                 model_instance=self.model,
@@ -908,12 +969,29 @@ class BatchedModelRunner(NPUModelRunner):
                 merged_inputs_embeds,
             )
 
+        head_hidden = hidden_states["hidden_states"]
+        head_residual = hidden_states["residual"]
+        # Undo the decode-first token reorder so per-dp_rank
+        # slicing produces hidden_states in cat-order
+        # (``scheduler_output`` order) — the cloud middle
+        # forward uses its own ``query_lens`` derived from the
+        # same ``scheduler_output`` and expects this layout.
+        if (inv_merged_token_perm is not None
+                and inv_merged_token_perm.numel() > 0):
+            head_hidden = torch.cat([
+                head_hidden[:inv_merged_token_perm.shape[0]][
+                    inv_merged_token_perm],
+                head_hidden[inv_merged_token_perm.shape[0]:],
+            ])
+            head_residual = torch.cat([
+                head_residual[:inv_merged_token_perm.shape[0]][
+                    inv_merged_token_perm],
+                head_residual[inv_merged_token_perm.shape[0]:],
+            ])
         token_offsets = [0]
         for n in n_actuals:
             token_offsets.append(token_offsets[-1] + n)
         results: list[IntermediateTensors] = []
-        head_hidden = hidden_states["hidden_states"]
-        head_residual = hidden_states["residual"]
         for i, b in enumerate(bundles):
             slice_hs = head_hidden[
                 token_offsets[i]:token_offsets[i + 1]]
@@ -936,6 +1014,7 @@ class BatchedModelRunner(NPUModelRunner):
                 }))
         return results
 
+    @torch.inference_mode()
     def execute_model_batched_tail(
         self,
         bundles: list[_ExecuteModelBundle],
@@ -972,6 +1051,57 @@ class BatchedModelRunner(NPUModelRunner):
                  for it, n in zip(intermediates, n_actuals_tail)])
         else:
             merged_residual = None
+
+        any_bundle = bundles[0]
+        is_non_embedding_only_edge = (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.role == "edge"
+            and self.edge_cloud_cfg.mode != "embedding_only")
+        # When non-embedding_only edge, the merged attn ctx
+        # applies a decode-first reorder so the attention
+        # kernel's ``split_decodes_and_prefills`` works on the
+        # merged layout. We need to permute the per-token
+        # inputs (cloud-returned intermediate tensors) into
+        # that same reordered layout BEFORE the tail forward
+        # reads them via ``merged_query_start_loc``.
+        if is_non_embedding_only_edge:
+            assert batched_dp_ranks is not None, (
+                "execute_model_batched_tail: batched_dp_ranks "
+                "required for non-embedding_only edge mode.")
+            ctx = self._get_or_build_merged_attn_ctx(
+                bundles, batched_dp_ranks)
+            tail_attn_metadata: Any = ctx.merged_attn_metadata
+            batch_descriptor = ctx.merged_batch_descriptor
+            cudagraph_mode = ctx.merged_cudagraph_mode
+            num_tokens_padded_merged = ctx.num_tokens_padded_merged
+            merged_token_perm = ctx.merged_token_perm
+            inv_merged_token_perm = ctx.inv_merged_token_perm
+            # ``merged_token_perm is None`` when the merged
+            # batch is decode-only and the reorder is a no-op
+            # (cat-order IS decode-first order); skip the
+            # permute work in that case.
+            if merged_token_perm is not None:
+                if merged_hidden is not None:
+                    merged_hidden = torch.cat([
+                        merged_hidden[:merged_token_perm.shape[0]][
+                            merged_token_perm],
+                        merged_hidden[merged_token_perm.shape[0]:],
+                    ])
+                if merged_residual is not None:
+                    merged_residual = torch.cat([
+                        merged_residual[:merged_token_perm.shape[0]][
+                            merged_token_perm],
+                        merged_residual[merged_token_perm.shape[0]:],
+                    ])
+        else:
+            tail_attn_metadata = any_bundle.attn_metadata
+            batch_descriptor = any_bundle.batch_desc
+            cudagraph_mode = any_bundle.cudagraph_mode
+            num_tokens_padded_merged = sum(
+                b.num_tokens_padded for b in bundles)
+            merged_token_perm = None
+            inv_merged_token_perm = None
+
         merged_intermediate = IntermediateTensors({
             "hidden_states": merged_hidden,
             "residual": merged_residual,
@@ -983,26 +1113,57 @@ class BatchedModelRunner(NPUModelRunner):
         merged_logits_indices = torch.cat(
             [bundles[i].logits_indices + token_offsets[i]
              for i in range(len(bundles))])
-
-        any_bundle = bundles[0]
-        is_non_embedding_only_edge = (
-            self._edge_cloud_enabled
-            and self.edge_cloud_cfg.role == "edge"
-            and self.edge_cloud_cfg.mode != "embedding_only")
-        if is_non_embedding_only_edge:
-            assert batched_dp_ranks is not None, (
-                "execute_model_batched_tail: batched_dp_ranks "
-                "required for non-embedding_only edge mode.")
-            ctx = self._get_or_build_merged_attn_ctx(
-                bundles, batched_dp_ranks)
-            tail_attn_metadata: Any = ctx.merged_attn_metadata
-            batch_descriptor = ctx.merged_batch_descriptor
-            num_tokens_padded_merged = ctx.num_tokens_padded_merged
-        else:
-            tail_attn_metadata = any_bundle.attn_metadata
-            batch_descriptor = any_bundle.batch_desc
-            num_tokens_padded_merged = sum(
-                b.num_tokens_padded for b in bundles)
+        # Map cat-order ``merged_logits_indices`` into the
+        # reordered (decode-first) merged token layout that
+        # ``_model_forward`` produces. After
+        # ``merged_sample_hidden_states = hidden_states[indices]``,
+        # each row corresponds to the same physical token the
+        # bundle's ``logits_indices`` originally pointed at.
+        if (inv_merged_token_perm is not None
+                and inv_merged_token_perm.numel() > 0
+                and merged_logits_indices.numel() > 0):
+            merged_logits_indices = inv_merged_token_perm.to(
+                self.device)[merged_logits_indices]
+        # FULL mode: copy ``intermediate_tensors`` to leader
+        # runner's pre-allocated buffer so ``seg_e`` (which is
+        # ``ACLGraphWrapper``-wrapped) reads from a stable
+        # device pointer across cudagraph captures. The
+        # pre-allocated buffer is lazily created here (same
+        # factory as NPUModelRunner's ``execute_model`` path)
+        # so we don't depend on ``execute_model`` having run
+        # first. The buffer is sized to ``self.max_num_tokens``
+        # (the per-dp_rank max); cudagraph dispatch clamps the
+        # merged padded size to within this bound, so the
+        # buffer is always large enough.
+        if cudagraph_mode == CUDAGraphMode.FULL:
+            if self.intermediate_tensors is None:
+                self.intermediate_tensors = (
+                    self.model.make_empty_intermediate_tensors(
+                        batch_size=self.max_num_tokens,
+                        dtype=self.dtype,
+                        device=self.device,
+                    ))
+            for k, v in merged_intermediate.items():
+                if not isinstance(v, torch.Tensor):
+                    continue
+                # Pad the tail (beyond ``merged_num_actual``)
+                # up to ``merged_num_tokens_padded`` with 0 so
+                # the pre-allocated buffer's padding carries a
+                # deterministic value (instead of whatever stale
+                # bytes were left from a previous round).
+                if v.shape[0] < num_tokens_padded_merged:
+                    pad_shape = list(v.shape)
+                    pad_shape[0] = (
+                        num_tokens_padded_merged - v.shape[0])
+                    pad = torch.zeros(
+                        pad_shape, dtype=v.dtype, device=v.device)
+                    v = torch.cat([v, pad], dim=0)
+                elif v.shape[0] > num_tokens_padded_merged:
+                    v = v[:num_tokens_padded_merged]
+                dst = self.intermediate_tensors[k][
+                    :num_tokens_padded_merged]
+                dst.copy_(v, non_blocking=True)
+                merged_intermediate[k] = dst
         kv_connector_output = None
         num_tokens_merged = sum(n_actuals_tail)
         num_tokens_across_dp_merged = None
@@ -1013,7 +1174,7 @@ class BatchedModelRunner(NPUModelRunner):
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens_padded_merged,
                 num_tokens_across_dp=num_tokens_across_dp_merged,
-                aclgraph_runtime_mode=any_bundle.cudagraph_mode,
+                aclgraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_descriptor,
                 num_actual_tokens=num_tokens_merged,
                 model_instance=self.model,
@@ -1049,10 +1210,23 @@ class BatchedModelRunner(NPUModelRunner):
             hidden_states[merged_logits_indices])
         merged_logits = self.model.compute_logits(
             merged_sample_hidden_states)
+        # Undo the decode-first token reorder so the worker's
+        # per-dp_rank slicing
+        # ``merged_hidden[token_offsets[i]:token_offsets[i+1]]``
+        # (in cat order) returns each dp_rank's tokens in the
+        # same layout as ``bundle[i].logits_indices`` expects.
+        if (inv_merged_token_perm is not None
+                and inv_merged_token_perm.numel() > 0):
+            hidden_states = torch.cat([
+                hidden_states[:inv_merged_token_perm.shape[0]][
+                    inv_merged_token_perm],
+                hidden_states[inv_merged_token_perm.shape[0]:],
+            ])
 
         return (hidden_states, merged_sample_hidden_states,
                 merged_logits, kv_connector_output)
 
+    @torch.inference_mode()
     def execute_model_post_batched(
         self,
         bundle: _ExecuteModelBundle,
@@ -1133,17 +1307,223 @@ class BatchedModelRunner(NPUModelRunner):
         sub-batches in Python
         (``_forward_c8_chunked_prefill``). That split assumes a
         contiguous ``[decodes…][prefills…]`` layout, which the
-        simple ``block_tables`` / ``slot_mapping`` /
-        ``actual_seq_lengths_q`` concat in ``_merge_layer_attn`` does
-        NOT guarantee when different dp_ranks have different
-        per-dp_rank ``attn_state``. We therefore refuse C8 layers
-        in the batched path; per-dp_rank execution handles them.
+        simple block_table / slot_mapping / cu_seqlen concat in
+        ``_get_or_build_merged_attn_ctx`` does NOT guarantee when
+        different dp_ranks have different per-dp_rank
+        ``attn_state``. We therefore refuse C8 layers in the
+        batched path; per-dp_rank execution handles them.
         """
         # The edge cloud shared model never runs through a
         # C8-quantized attention layer today, so returning False is
         # correct in practice.
         del layer_name
         return False
+
+    def _apply_decode_first_reorder(
+        self,
+        need_reorder: bool,
+        merged_query_start_loc_cpu: torch.Tensor,
+        merged_num_reqs: int,
+        merged_num_reqs_padded: int,
+        merged_num_tokens_padded: int,
+        merged_cudagraph_mode: "CUDAGraphMode",
+        merged_seq_lens: torch.Tensor | None,
+        merged_seq_lens_cpu: torch.Tensor | None,
+        merged_seq_lens_cpu_upper: torch.Tensor | None,
+        merged__seq_lens_cpu: torch.Tensor | None,
+        merged_num_computed_tokens_cpu: torch.Tensor | None,
+        merged_is_prefilling: torch.Tensor | None,
+    ):
+        """Apply the decode-first reorder to the cat-order
+        ``merged_*`` tensors.
+
+        When ``need_reorder`` is False (e.g.
+        ``merged_attn_state == AscendAttentionState.DecodeOnly``,
+        every req is a decode), this method still produces
+        well-formed identity perm tensors
+        (``merged_perm = arange(...)``, ``merged_token_perm =
+        arange(...)``, etc.) and a ``merged_query_start_loc_cpu``
+        copy of the input — so downstream permute / un-permute
+        code in ``_get_or_build_merged_attn_ctx`` /
+        ``execute_model_batched_head`` /
+        ``execute_model_batched_tail`` stays uniform regardless
+        of whether the reorder was actually applied.
+
+        Returns a tuple of
+        ``(merged_query_start_loc_cpu, merged_query_start_loc,
+        merged_perm, merged_token_perm, inv_merged_token_perm,
+        merged_seq_lens, merged_seq_lens_cpu,
+        merged_seq_lens_cpu_upper, merged__seq_lens_cpu,
+        merged_num_computed_tokens_cpu,
+        merged_is_prefilling)``. ``merged_perm`` is the
+        per-req perm used by the caller's Step 5 per-gid
+        permute (block_tables / encoder_seq_lens /
+        extra_args); when ``need_reorder`` is False it's
+        ``None`` and Step 5 skips the permute.
+        """
+        if not need_reorder:
+            # Identity perm: cat-order == decode-first order
+            # (every actual row is a decode). Signal no-reorder
+            # downstream by setting perm tensors to ``None``
+            # — the head/tail stages ``is None`` checks skip
+            # every permute / un-permute operation. ``merged_perm``
+            # is also ``None``; the caller's Step 5 per-gid
+            # permute gates on ``need_reorder`` so it skips.
+            merged_perm = None
+            merged_token_perm = None
+            inv_merged_token_perm = None
+            # The pre-allocated ``self.query_start_loc.gpu``
+            # buffer is filled in the caller (FULL-mode copy
+            # happens there too).
+            merged_query_start_loc = (
+                merged_query_start_loc_cpu.to(self.device))
+            return (
+                merged_query_start_loc_cpu,
+                merged_query_start_loc,
+                merged_perm,
+                merged_token_perm,
+                inv_merged_token_perm,
+                merged_seq_lens,
+                merged_seq_lens_cpu,
+                merged_seq_lens_cpu_upper,
+                merged__seq_lens_cpu,
+                merged_num_computed_tokens_cpu,
+                merged_is_prefilling,
+            )
+
+        # ---- Decode-first perm computation.
+        # A req is classified as **prefill** iff ``query_len > 1
+        # OR is_prefilling`` (matches
+        # ``split_decodes_and_prefills`` with
+        # ``decode_threshold = 1`` and
+        # ``treat_short_extends_as_decodes=False``).
+        # Padded rows (idx >= merged_num_reqs) are appended
+        # AFTER prefill rows so the kernel's ``first_prefill``
+        # correctly identifies the decode/prefill boundary.
+        merged_query_lens_cpu_actual = (
+            merged_query_start_loc_cpu[1:merged_num_reqs + 1]
+            - merged_query_start_loc_cpu[:merged_num_reqs])
+        if merged_is_prefilling is not None:
+            is_prefill_merged_actual = (
+                (merged_query_lens_cpu_actual > 1)
+                | merged_is_prefilling[:merged_num_reqs])
+        else:
+            is_prefill_merged_actual = (
+                merged_query_lens_cpu_actual > 1)
+        decode_indices = torch.where(
+            ~is_prefill_merged_actual)[0]
+        prefill_indices = torch.where(
+            is_prefill_merged_actual)[0]
+        padded_indices = torch.arange(
+            merged_num_reqs, merged_num_reqs_padded,
+            dtype=torch.int64)
+        merged_perm = torch.cat([
+            decode_indices.to(torch.int64),
+            prefill_indices.to(torch.int64),
+            padded_indices,
+        ])
+
+        # ``merged_token_perm`` maps cat-order token index →
+        # reordered token index. Each req ``i_old`` in cat-order
+        # has token range ``[cat_qsl[i_old]:cat_qsl[i_old+1]]``;
+        # in the reordered tensor it occupies position
+        # ``sum(query_lens[merged_perm[:k]])`` for ``k = new
+        # position of i_old``. We build it by walking the
+        # reorder in new-position order and emitting the
+        # cat-order token indices for that req.
+        cat_qsl_actual = merged_query_start_loc_cpu[
+            :merged_num_reqs + 1]
+        merged_token_perm_parts: list[torch.Tensor] = []
+        for k in range(merged_num_reqs):
+            i_old = merged_perm[k].item()
+            s = cat_qsl_actual[i_old].item()
+            e = cat_qsl_actual[i_old + 1].item()
+            merged_token_perm_parts.append(
+                torch.arange(s, e, dtype=torch.int64))
+        if merged_token_perm_parts:
+            merged_token_perm = torch.cat(
+                merged_token_perm_parts)
+        else:
+            merged_token_perm = torch.empty(
+                0, dtype=torch.int64)
+        # ``inv_merged_token_perm``: reordered → cat-order.
+        # Only valid for the actual-merged range
+        # (``merged_num_actual_tokens``); padded token
+        # positions are absent.
+        inv_merged_token_perm = torch.empty_like(
+            merged_token_perm)
+        if merged_token_perm.numel() > 0:
+            inv_merged_token_perm[merged_token_perm] = (
+                torch.arange(
+                    merged_token_perm.shape[0],
+                    dtype=torch.int64))
+
+        # ---- Apply ``merged_perm`` to per-req fields. After
+        # this point, every per-req tensor is in decode-first
+        # order.
+        # ``merged_seq_lens_cpu_upper`` is never ``None``
+        # (always present in the standard path). Permute it
+        # and re-establish aliases for ``merged__seq_lens_cpu``
+        # and ``merged_seq_lens_cpu`` (``merged__seq_lens_cpu``
+        # is always non-None, ``merged_seq_lens_cpu`` may be
+        # ``None`` in async spec decode — preserve that).
+        merged_seq_lens_cpu_upper = (
+            merged_seq_lens_cpu_upper[merged_perm].contiguous())
+        merged__seq_lens_cpu = merged_seq_lens_cpu_upper
+        if merged_seq_lens_cpu is not None:
+            merged_seq_lens_cpu = merged_seq_lens_cpu_upper
+        if merged_num_computed_tokens_cpu is not None:
+            merged_num_computed_tokens_cpu = (
+                merged_num_computed_tokens_cpu[merged_perm]
+                .contiguous())
+        if merged_is_prefilling is not None:
+            merged_is_prefilling = (
+                merged_is_prefilling[merged_perm].contiguous())
+        # NPU ``merged_seq_lens`` is consumed by some kernels
+        # too; permute it as well.
+        if merged_seq_lens is not None:
+            merged_seq_lens = (
+                merged_seq_lens[merged_perm].contiguous())
+
+        # ---- Re-cumsum the actual portion of
+        # ``merged_query_start_loc_cpu`` from the permuted
+        # per-req scheduled token count
+        # (``merged_query_lens_cpu_actual`` already computed
+        # above for the perm construction), and reuse the
+        # already-built padded tail from Step 3. Padded rows
+        # are dummy (uniform/mixed constant or arange);
+        # reusing the cat-order padded tail is safe because
+        # their values don't depend on req order. NOTE:
+        # ``seq_lens`` is NOT the right input — it is the
+        # total context length, not the scheduled count, and
+        # these differ for prefill reqs.
+        qsl_actual = torch.zeros(
+            merged_num_reqs + 1, dtype=torch.int32)
+        qsl_actual[1:] = torch.cumsum(
+            merged_query_lens_cpu_actual[merged_perm], dim=0)
+        merged_query_start_loc_cpu = torch.cat([
+            qsl_actual,
+            merged_query_start_loc_cpu[merged_num_reqs + 1:],
+        ])
+        # The pre-allocated ``self.query_start_loc.gpu``
+        # buffer is filled in the caller (FULL-mode copy
+        # happens there too).
+        merged_query_start_loc = (
+            merged_query_start_loc_cpu.to(self.device))
+
+        return (
+            merged_query_start_loc_cpu,
+            merged_query_start_loc,
+            merged_perm,
+            merged_token_perm,
+            inv_merged_token_perm,
+            merged_seq_lens,
+            merged_seq_lens_cpu,
+            merged_seq_lens_cpu_upper,
+            merged__seq_lens_cpu,
+            merged_num_computed_tokens_cpu,
+            merged_is_prefilling,
+        )
 
     def _get_or_build_merged_attn_ctx(
         self,
@@ -1175,51 +1555,57 @@ class BatchedModelRunner(NPUModelRunner):
                 "called but self._per_dp_offsets is unset. Did "
                 "initialize_kv_cache run for all dp_ranks?")
 
-        def _layer_dict(b: "_ExecuteModelBundle") -> dict:
-            md = b.attn_metadata
-            return md[0] if isinstance(md, list) else md
-
-        template_layers = list(_layer_dict(bundles[0]).keys())
-        for b in bundles[1:]:
-            assert _layer_dict(b).keys() == set(template_layers), (
-                "dp_rank attn_metadata layer sets must agree across "
-                "dp_ranks for batched forward")
-
-        merged_attn_metadata: dict = {}
-        from vllm_ascend.attention.attention_v1 import AscendMetadata
-        from vllm.v1.attention.backends.gdn_attn import (
-            GDNAttentionMetadata,
+        from vllm_ascend.attention.attention_v1 import (
+            AscendAttentionState,
         )
 
-        def _merge_layer(layer_name: str):
-            md_template = _layer_dict(bundles[0])[layer_name]
-            bpb = self._get_bpb_for_layer(layer_name)
-            if isinstance(md_template, AscendMetadata):
-                return self._merge_layer_attn(
-                    layer_name, bundles, batched_dp_ranks,
-                    per_dp_offsets, bpb)
-            elif isinstance(md_template, GDNAttentionMetadata):
-                return self._merge_gdn_layer_attn(
-                    layer_name, bundles, batched_dp_ranks,
-                    per_dp_offsets, bpb)
-            else:
+        dp_size = self.parallel_config.data_parallel_size
+        bs = self.block_size
+        num_kv_cache_gids = len(self.kv_cache_config.kv_cache_groups)
+
+        # ---- Step 0: per-dp_rank unpad (slide per-req fields down
+        # to actual sizes via ``cm.unpadded``).
+        cms_unpadded: list[AscendCommonAttentionMetadata] = []
+        for b in bundles:
+            cm = b.common_attn_metadata
+            cms_unpadded.append(
+                cm.unpadded(cm.num_actual_tokens, b.num_reqs_actual))
+
+        # ---- Step 1: merged scalars + ``attn_state`` unification.
+        merged_num_actual_tokens = sum(
+            cm.num_actual_tokens for cm in cms_unpadded)
+        merged_max_query_len = max(cm.max_query_len for cm in cms_unpadded)
+        merged_max_seq_len = max(cm.max_seq_len for cm in cms_unpadded)
+        # ``merged_num_reqs`` is the sum of per-dp_rank actual
+        # request counts (NOT the cudagraph-padded total). The
+        # merged tensor is initially this size, and per-req fields
+        # are then padded out to ``merged_num_reqs_padded`` (see
+        # ``_cat_per_req_pad``).
+        merged_num_reqs = sum(b.num_reqs_actual for b in bundles)
+
+        states = [cm.attn_state for cm in cms_unpadded]
+        unique_states = set(states)
+        if len(unique_states) > 1:
+            if AscendAttentionState.SpecDecoding in unique_states:
                 raise NotImplementedError(
-                    f"Unsupported attention metadata type for "
-                    f"layer {layer_name!r}: "
-                    f"{type(md_template).__name__}; batched forward "
-                    f"currently supports AscendMetadata and "
-                    f"GDNAttentionMetadata only.")
+                    "Cannot merge SpecDecoding with other states "
+                    f"{unique_states}; SpecDecoding uses a "
+                    "separate tree path that the batched forward "
+                    "does not yet support.")
+            merged_attn_state = AscendAttentionState.ChunkedPrefill
+        else:
+            merged_attn_state = next(iter(unique_states))
 
-        for layer_name in template_layers:
-            merged_attn_metadata[layer_name] = _merge_layer(
-                layer_name)
-
-        first_merged = next(iter(merged_attn_metadata.values()))
-        num_tokens_merged = first_merged.num_actual_tokens
+        # ---- Step 2: dispatch the merged batch to get the merged
+        # padded sizes and the merged ``CUDAGraphMode``. The merged
+        # mode is what the batched head/tail forward should run
+        # under (NOT a single dp_rank's mode).
         any_batch_desc = bundles[0].batch_desc
         if any_batch_desc is None:
             merged_batch_descriptor = None
-            num_tokens_padded_merged = num_tokens_merged
+            merged_cudagraph_mode = CUDAGraphMode.NONE
+            merged_num_tokens_padded = merged_num_actual_tokens
+            merged_num_reqs_padded = merged_num_reqs
         else:
             has_lora_any = any(
                 b.batch_desc is not None and b.batch_desc.has_lora
@@ -1231,18 +1617,650 @@ class BatchedModelRunner(NPUModelRunner):
                 (b.batch_desc.num_active_loras
                  if b.batch_desc is not None else 0)
                 for b in bundles)
-            _, merged_batch_descriptor = (
+            merged_cudagraph_mode, merged_batch_descriptor = (
                 self.cudagraph_dispatcher.dispatch(
-                    num_tokens=num_tokens_merged,
+                    num_tokens=merged_num_actual_tokens,
                     has_lora=has_lora_any,
                     uniform_decode=uniform_decode_merged,
                     valid_modes=None,
-                    invalid_modes={CUDAGraphMode.FULL},
+                    invalid_modes=None,
                     num_active_loras=num_active_loras_merged,
                 ))
-            num_tokens_padded_merged = (
+            merged_num_reqs_padded = (
+                merged_batch_descriptor.num_reqs
+                if merged_batch_descriptor.num_reqs is not None
+                else merged_num_reqs)
+            merged_num_tokens_padded = (
                 merged_batch_descriptor.num_tokens)
 
+        # ---- Step 3: merged cu_seqlen (``query_start_loc`` /
+        # ``query_start_loc_cpu``). Unpad → cumsum-merge → pad to
+        # ``merged_num_reqs_padded + 1`` by repeating the last
+        # value (padded rows have query length 0).
+        merged_qsl_cpu_list = [0]
+        for cm in cms_unpadded:
+            n = cm.num_reqs  # == num_reqs_actual (unpadded)
+            if n > 0:
+                local = cm.query_start_loc_cpu[1:n + 1]
+                cumulative = local + merged_qsl_cpu_list[-1]
+                merged_qsl_cpu_list.extend(cumulative.tolist())
+            else:
+                merged_qsl_cpu_list.append(merged_qsl_cpu_list[-1])
+        merged_query_start_loc_cpu = torch.tensor(
+            merged_qsl_cpu_list, dtype=torch.int32, device="cpu")
+        if (merged_query_start_loc_cpu.shape[0] - 1
+                < merged_num_reqs_padded):
+            last = merged_query_start_loc_cpu[-1].item()
+            if merged_num_tokens_padded == merged_num_reqs_padded * self.uniform_decode_query_len:
+                pad = torch.arange(1, merged_num_reqs_padded + 1 - merged_num_reqs, dtype=torch.int32, device="cpu") * self.uniform_decode_query_len + last
+            else:
+                pad = torch.full(
+                    (merged_num_reqs_padded + 1
+                    - merged_query_start_loc_cpu.shape[0],),
+                    last, dtype=torch.int32, device="cpu")
+            merged_query_start_loc_cpu = torch.cat(
+                [merged_query_start_loc_cpu, pad])
+        elif (merged_query_start_loc_cpu.shape[0] - 1
+              > merged_num_reqs_padded):
+            merged_query_start_loc_cpu = merged_query_start_loc_cpu[
+                :merged_num_reqs_padded + 1]
+        merged_query_start_loc = merged_query_start_loc_cpu.to(
+            self.device)
+        # The FULL mode buffer copy happens AFTER the
+        # decode-first reorder (further down) so the buffer
+        # reflects the reordered (decode-first) layout the
+        # attention kernel consumes.
+
+        # ---- Step 4: merged per-req fields via unpad-cat-pad.
+        def _cat_per_req_pad(get_field, pad_value, dtype,
+                             device) -> torch.Tensor | None:
+            parts = [get_field(cm) for cm in cms_unpadded]
+            parts = [p for p in parts if p is not None]
+            if not parts:
+                return None
+            merged = torch.cat(parts, dim=0)
+            if merged.shape[0] < merged_num_reqs_padded:
+                pad_shape = list(merged.shape)
+                pad_shape[0] = (
+                    merged_num_reqs_padded - merged.shape[0])
+                pad = torch.full(
+                    pad_shape, pad_value, dtype=dtype, device=device)
+                merged = torch.cat([merged, pad], dim=0)
+            elif merged.shape[0] > merged_num_reqs_padded:
+                merged = merged[:merged_num_reqs_padded]
+            return merged
+
+        any_cm = cms_unpadded[0] if cms_unpadded else bundles[
+            0].common_attn_metadata
+        merged_seq_lens = _cat_per_req_pad(
+            lambda cm: cm.seq_lens, 0, any_cm.seq_lens.dtype,
+            self.device)
+        merged_seq_lens_cpu_upper = _cat_per_req_pad(
+            lambda cm: cm.seq_lens_cpu_upper_bound, 0,
+            any_cm.seq_lens_cpu_upper_bound.dtype
+            if any_cm.seq_lens_cpu_upper_bound is not None
+            else torch.int32,
+            "cpu") if any(cm.seq_lens_cpu_upper_bound is not None
+                          for cm in cms_unpadded) else None
+        # Per ``model_runner_v1.py:4393-4396`` invariant:
+        # ``_seq_lens_cpu`` is always
+        # ``self.optimistic_seq_lens_cpu[:num_reqs_padded]`` (same
+        # buffer as ``seq_lens_cpu_upper_bound``); ``seq_lens_cpu``
+        # is either that same buffer or ``None`` (async spec
+        # decode). Reuse the upper buffer as an alias here so the
+        # three fields share one cat output and one FULL-mode
+        # ``copy_``.
+        merged__seq_lens_cpu = merged_seq_lens_cpu_upper
+        if any(cm.seq_lens_cpu is not None for cm in cms_unpadded):
+            merged_seq_lens_cpu = merged_seq_lens_cpu_upper
+        else:
+            merged_seq_lens_cpu = None
+        merged_num_computed_tokens_cpu = _cat_per_req_pad(
+            lambda cm: cm.num_computed_tokens_cpu, 0,
+            any_cm.num_computed_tokens_cpu.dtype
+            if any_cm.num_computed_tokens_cpu is not None
+            else torch.int32,
+            "cpu") if any(cm.num_computed_tokens_cpu is not None
+                          for cm in cms_unpadded) else None
+        # ``is_prefilling``: pad value is False (matches
+        # ``_build_attention_metadata`` line 4378). The tensor
+        # itself is on CPU (built by comparing the CPU
+        # ``num_computed_tokens_cpu_tensor`` /
+        # ``num_prompt_tokens_cpu_tensor``), so the merged tensor
+        # also lives on CPU.
+        merged_is_prefilling = _cat_per_req_pad(
+            lambda cm: cm.is_prefilling, False,
+            torch.bool, "cpu")
+        if merged_is_prefilling is not None:
+            merged_is_prefilling[merged_num_reqs:] = False
+
+        # ---- Decode-first reorder (2-way: decode → prefill).
+        # Many attention builders (notably
+        # ``GDNAttentionMetadataBuilder``) call
+        # ``split_decodes_and_prefills`` which assumes the batch
+        # is already in decode-first order
+        # (``first_prefill = argmax(is_prefill)`` gives
+        # ``num_decodes`` directly). Per-dp_rank ``_may_reorder_
+        # batch`` only sorts INSIDE a single dp_rank; the merged
+        # batch still needs a global decode-first reorder.
+        #
+        # The reorder is a no-op when ``merged_attn_state ==
+        # AscendAttentionState.DecodeOnly`` (every req is a
+        # decode) — ``decode_indices`` already covers all
+        # actual rows in cat order, ``prefill_indices`` is
+        # empty, padded rows go to the tail unchanged.
+        # ``_apply_decode_first_reorder`` short-circuits in
+        # that case and produces identity perm tensors so the
+        # downstream permute calls below stay uniform.
+        need_reorder = (
+            merged_attn_state != AscendAttentionState.DecodeOnly)
+        (
+            merged_query_start_loc_cpu,
+            merged_query_start_loc,
+            merged_perm,
+            merged_token_perm,
+            inv_merged_token_perm,
+            merged_seq_lens,
+            merged_seq_lens_cpu,
+            merged_seq_lens_cpu_upper,
+            merged__seq_lens_cpu,
+            merged_num_computed_tokens_cpu,
+            merged_is_prefilling,
+        ) = self._apply_decode_first_reorder(
+            need_reorder=need_reorder,
+            merged_query_start_loc_cpu=(
+                merged_query_start_loc_cpu),
+            merged_num_reqs=merged_num_reqs,
+            merged_num_reqs_padded=merged_num_reqs_padded,
+            merged_num_tokens_padded=merged_num_tokens_padded,
+            merged_cudagraph_mode=merged_cudagraph_mode,
+            merged_seq_lens=merged_seq_lens,
+            merged_seq_lens_cpu=merged_seq_lens_cpu,
+            merged_seq_lens_cpu_upper=(
+                merged_seq_lens_cpu_upper),
+            merged__seq_lens_cpu=merged__seq_lens_cpu,
+            merged_num_computed_tokens_cpu=(
+                merged_num_computed_tokens_cpu),
+            merged_is_prefilling=merged_is_prefilling,
+        )
+        # FULL mode: copy the permuted
+        # ``merged_seq_lens_cpu_upper`` to the leader runner's
+        # pre-allocated ``self.optimistic_seq_lens_cpu`` buffer
+        # so the attention kernel reads from a stable CPU
+        # pointer across cudagraph captures. Re-establish the
+        # aliases for ``merged_seq_lens_cpu`` /
+        # ``merged__seq_lens_cpu`` so they share the same
+        # stable address (matching the standard path's
+        # invariant at ``model_runner_v1.py:4393-4396``).
+        if merged_cudagraph_mode == CUDAGraphMode.FULL:
+            self.optimistic_seq_lens_cpu[
+                :merged_num_reqs_padded].copy_(
+                    merged_seq_lens_cpu_upper)
+            seq_lens_cpu_buf = (
+                self.optimistic_seq_lens_cpu[
+                    :merged_num_reqs_padded])
+            merged_seq_lens_cpu_upper = seq_lens_cpu_buf
+            merged__seq_lens_cpu = seq_lens_cpu_buf
+            if merged_seq_lens_cpu is not None:
+                merged_seq_lens_cpu = seq_lens_cpu_buf
+            # NPU ``merged_seq_lens``: copy to leader runner's
+            # ``self.seq_lens`` buffer so the attention kernel
+            # reads from a stable device pointer across
+            # cudagraph captures.
+            if merged_seq_lens is not None:
+                self.seq_lens[:merged_num_reqs_padded].copy_(
+                    merged_seq_lens)
+                merged_seq_lens = (
+                    self.seq_lens[:merged_num_reqs_padded])
+            # ``merged_query_start_loc``: copy to leader runner's
+            # pre-allocated ``self.query_start_loc.gpu`` buffer
+            # so the kernel reads from a stable device pointer
+            # across cudagraph captures.
+            self.query_start_loc.gpu[
+                :merged_num_reqs_padded + 1].copy_(
+                    merged_query_start_loc)
+            merged_query_start_loc = (
+                self.query_start_loc.gpu[
+                    :merged_num_reqs_padded + 1])
+
+        # ``positions`` / ``positions_cpu`` (DSA): ``unpadded``
+        # keeps them full-length; slice to
+        # ``[:num_actual_tokens]`` and cat.
+        if all(cm.positions is not None for cm in cms_unpadded):
+            merged_positions = torch.cat(
+                [cm.positions[:cm.num_actual_tokens]
+                 for cm in cms_unpadded],
+                dim=-1)
+            if merged_positions.shape[-1] < merged_num_tokens_padded:
+                pad_shape = list(merged_positions.shape)
+                pad_shape[-1] = (
+                    merged_num_tokens_padded
+                    - merged_positions.shape[-1])
+                pad = torch.zeros(
+                    pad_shape, dtype=merged_positions.dtype,
+                    device=merged_positions.device)
+                merged_positions = torch.cat(
+                    [merged_positions, pad], dim=-1)
+            elif (merged_positions.shape[-1]
+                  > merged_num_tokens_padded):
+                merged_positions = merged_positions[
+                    ..., :merged_num_tokens_padded]
+            # Decode-first reorder: ``positions`` is per-token,
+            # apply ``merged_token_perm`` over the actual range.
+            # Padded positions (>= merged_num_actual_tokens)
+            # keep their zero fill.
+            if (merged_num_actual_tokens > 0
+                    and need_reorder):
+                merged_positions_actual = (
+                    merged_positions[
+                        ..., :merged_num_actual_tokens][
+                        ..., merged_token_perm])
+                merged_positions = torch.cat([
+                    merged_positions_actual,
+                    merged_positions[
+                        ..., merged_num_actual_tokens:],
+                ], dim=-1)
+            # FULL mode: copy to leader runner's pre-allocated
+            # ``self.positions`` buffer so ``cm_merged.positions``
+            # (a slice view of this buffer) and
+            # ``_model_forward(positions=...)`` share a stable
+            # device pointer across cudagraph captures.
+            if merged_cudagraph_mode == CUDAGraphMode.FULL:
+                self.positions[:merged_num_tokens_padded].copy_(
+                    merged_positions)
+                merged_positions = (
+                    self.positions[:merged_num_tokens_padded])
+        else:
+            merged_positions = None
+        if all(cm.positions_cpu is not None for cm in cms_unpadded):
+            merged_positions_cpu = torch.cat(
+                [cm.positions_cpu[:cm.num_actual_tokens]
+                 for cm in cms_unpadded],
+                dim=-1)
+            if (merged_positions_cpu.shape[-1]
+                    < merged_num_tokens_padded):
+                pad_shape = list(merged_positions_cpu.shape)
+                pad_shape[-1] = (
+                    merged_num_tokens_padded
+                    - merged_positions_cpu.shape[-1])
+                pad = torch.zeros(
+                    pad_shape,
+                    dtype=merged_positions_cpu.dtype,
+                    device=merged_positions_cpu.device)
+                merged_positions_cpu = torch.cat(
+                    [merged_positions_cpu, pad], dim=-1)
+            elif (merged_positions_cpu.shape[-1]
+                  > merged_num_tokens_padded):
+                merged_positions_cpu = merged_positions_cpu[
+                    ..., :merged_num_tokens_padded]
+            if (merged_num_actual_tokens > 0
+                    and need_reorder):
+                merged_positions_cpu_actual = (
+                    merged_positions_cpu[
+                        ..., :merged_num_actual_tokens][
+                        ..., merged_token_perm])
+                merged_positions_cpu = torch.cat([
+                    merged_positions_cpu_actual,
+                    merged_positions_cpu[
+                        ..., merged_num_actual_tokens:],
+                ], dim=-1)
+        else:
+            merged_positions_cpu = None
+
+        # ``actual_seq_lengths_q`` is the per-req prefix-sum of
+        # scheduled tokens (``query_start_loc_cpu[1:]``), built
+        # by ``AscendMetadataBuilder.build`` as
+        # ``query_start_loc_cpu[1:].tolist()``. Each element is
+        # the cumulative token count at that req — NOT a
+        # per-token expansion. So the merged value is just the
+        # reordered merged qsl minus its leading ``0``
+        # (``qsl[0]`` is always 0).
+        if all(cm.actual_seq_lengths_q is not None
+               and len(cm.actual_seq_lengths_q) > 0
+               for cm in cms_unpadded):
+            merged_actual_seq_lengths_q = (
+                merged_query_start_loc_cpu[1:].tolist())
+        else:
+            merged_actual_seq_lengths_q = None
+
+        # ---- Step 5: per-(kv_cache_gid, attn_gid) build.
+        merged_attn_metadata: dict = {}
+        from vllm.v1.attention.backends.gdn_attn import (
+            GDNAttentionMetadataBuilder,
+        )
+        for kv_cache_gid in range(num_kv_cache_gids):
+            for attn_gid in range(
+                    len(self.attn_groups[kv_cache_gid])):
+                attn_group = self.attn_groups[kv_cache_gid][attn_gid]
+                builder = attn_group.get_metadata_builder(0)
+                bpb = self._get_bpb_for_layer(
+                    attn_group.layer_names[0])
+
+                # Per-gid block_table_tensor. gid=0 is on
+                # ``cm_base.block_table_tensor`` (kept full-length
+                # by ``unpadded``); gid>0 lives on
+                # ``b.per_gid_cm[kv_cache_gid]["block_table_tensor"]``
+                # (saved by ``_save('block_table_tensor')`` in
+                # ``_build_attention_metadata`` only for
+                # ``kv_cache_gid > 0``). Unpad to actual
+                # num_reqs_actual, remap+cat, pad to
+                # ``merged_num_reqs_padded``.
+                parts_bt = []
+                for cm_unpadded, b, k in zip(
+                        cms_unpadded, bundles, batched_dp_ranks):
+                    if kv_cache_gid == 0:
+                        gid_bt = cm_unpadded.block_table_tensor
+                    else:
+                        gid_bt = b.per_gid_cm[kv_cache_gid][
+                            "block_table_tensor"]
+                    local = gid_bt[:b.num_reqs_actual]
+                    remapped = torch.where(
+                        local == 0, local,
+                        ((local // bpb) * dp_size
+                         + per_dp_offsets[k]) * bpb
+                        + (local % bpb))
+                    parts_bt.append(remapped)
+                merged_block_tables = torch.cat(parts_bt, dim=0)
+                if (merged_block_tables.shape[0]
+                        < merged_num_reqs_padded):
+                    pad_shape = list(merged_block_tables.shape)
+                    pad_shape[0] = (
+                        merged_num_reqs_padded
+                        - merged_block_tables.shape[0])
+                    pad = torch.zeros(
+                        pad_shape,
+                        dtype=merged_block_tables.dtype,
+                        device=merged_block_tables.device)
+                    merged_block_tables = torch.cat(
+                        [merged_block_tables, pad], dim=0)
+                elif (merged_block_tables.shape[0]
+                      > merged_num_reqs_padded):
+                    merged_block_tables = merged_block_tables[
+                        :merged_num_reqs_padded]
+                # Decode-first reorder: ``block_table_tensor`` is
+                # per-req, so apply ``merged_perm``. Padded rows
+                # (``merged_perm[merged_num_reqs:]``) map to
+                # themselves so the row identity is preserved.
+                # In DecodeOnly mode (``need_reorder=False``) the
+                # perm is the identity map so the slice is a
+                # no-op; ``.contiguous()`` is still safe.
+                if need_reorder:
+                    merged_block_tables = (
+                        merged_block_tables[merged_perm]
+                        .contiguous())
+                # FULL mode: copy to leader runner's pre-allocated
+                # per-gid block_table buffer so ``cm_merged``
+                # (a slice view of this buffer) has a stable
+                # device pointer across cudagraph captures.
+                if merged_cudagraph_mode == CUDAGraphMode.FULL:
+                    self.input_batch.block_table[
+                        kv_cache_gid].block_table.gpu[
+                            :merged_num_reqs_padded].copy_(
+                                merged_block_tables)
+                    merged_block_tables = (
+                        self.input_batch.block_table[
+                            kv_cache_gid].block_table.gpu[
+                                :merged_num_reqs_padded])
+
+                # Per-gid slot_mapping.
+                parts_sm = []
+                for cm_unpadded, b, k in zip(
+                        cms_unpadded, bundles, batched_dp_ranks):
+                    if kv_cache_gid == 0:
+                        gid_sm = cm_unpadded.slot_mapping
+                    else:
+                        gid_sm = b.per_gid_cm[kv_cache_gid][
+                            "slot_mapping"]
+                    n = b.common_attn_metadata.num_actual_tokens
+                    local = gid_sm[:n]
+                    remapped = torch.where(
+                        local == PAD_SLOT_ID, local,
+                        ((local // bs) * dp_size
+                         + per_dp_offsets[k]) * bs
+                        + (local % bs))
+                    parts_sm.append(remapped)
+                merged_slot_mapping = torch.cat(parts_sm, dim=0)
+                if (merged_slot_mapping.shape[0]
+                        < merged_num_tokens_padded):
+                    pad = torch.full(
+                        (merged_num_tokens_padded
+                         - merged_slot_mapping.shape[0],),
+                        PAD_SLOT_ID,
+                        dtype=merged_slot_mapping.dtype,
+                        device=merged_slot_mapping.device)
+                    merged_slot_mapping = torch.cat(
+                        [merged_slot_mapping, pad], dim=0)
+                elif (merged_slot_mapping.shape[0]
+                      > merged_num_tokens_padded):
+                    merged_slot_mapping = merged_slot_mapping[
+                        :merged_num_tokens_padded]
+                # Decode-first reorder: ``slot_mapping`` is
+                # per-token, so apply ``merged_token_perm`` over
+                # the actual-merged range. Padded positions
+                # (``>= merged_num_actual_tokens``) keep their
+                # ``PAD_SLOT_ID`` filler untouched. In
+                # DecodeOnly mode the perm is the identity map
+                # so this is skipped.
+                if (merged_num_actual_tokens > 0
+                        and need_reorder):
+                    merged_slot_mapping_actual = (
+                        merged_slot_mapping[
+                            :merged_num_actual_tokens][
+                            merged_token_perm])
+                    merged_slot_mapping = torch.cat([
+                        merged_slot_mapping_actual,
+                        merged_slot_mapping[
+                            merged_num_actual_tokens:],
+                    ])
+                # FULL mode: copy to leader runner's pre-allocated
+                # per-gid slot_mapping buffer so ``cm_merged``
+                # (a slice view of this buffer) has a stable
+                # device pointer across cudagraph captures.
+                if merged_cudagraph_mode == CUDAGraphMode.FULL:
+                    self.input_batch.block_table[
+                        kv_cache_gid].slot_mapping.gpu[
+                            :merged_num_tokens_padded].copy_(
+                                merged_slot_mapping)
+                    merged_slot_mapping = (
+                        self.input_batch.block_table[
+                            kv_cache_gid].slot_mapping.gpu[
+                            :merged_num_tokens_padded])
+
+                # Per-gid encoder_seq_lens / encoder_seq_lens_cpu.
+                def _cat_per_gid_per_req(field_name, pad_value):
+                    tensors = []
+                    for b in bundles:
+                        t = b.per_gid_cm[kv_cache_gid].get(field_name)
+                        if t is not None:
+                            tensors.append((b, t))
+                    if not tensors:
+                        return None
+                    merged = torch.cat(
+                        [t[:b.num_reqs_actual] for b, t in tensors],
+                        dim=0)
+                    if merged.shape[0] < merged_num_reqs_padded:
+                        pad_shape = list(merged.shape)
+                        pad_shape[0] = (
+                            merged_num_reqs_padded - merged.shape[0])
+                        pad = torch.full(
+                            pad_shape, pad_value,
+                            dtype=merged.dtype,
+                            device=merged.device)
+                        merged = torch.cat([merged, pad], dim=0)
+                    elif merged.shape[0] > merged_num_reqs_padded:
+                        merged = merged[:merged_num_reqs_padded]
+                    return merged
+
+                merged_encoder_seq_lens = _cat_per_gid_per_req(
+                    "encoder_seq_lens", 0)
+                merged_encoder_seq_lens_cpu = _cat_per_gid_per_req(
+                    "encoder_seq_lens_cpu", 0)
+                # Decode-first reorder: encoder_seq_lens is
+                # per-req, apply ``merged_perm`` (padded rows
+                # carry 0 and reorder among themselves, harmless).
+                # In DecodeOnly mode the perm is the identity
+                # map so the slice is skipped.
+                if need_reorder:
+                    if merged_encoder_seq_lens is not None:
+                        merged_encoder_seq_lens = (
+                            merged_encoder_seq_lens[merged_perm]
+                            .contiguous())
+                    if merged_encoder_seq_lens_cpu is not None:
+                        merged_encoder_seq_lens_cpu = (
+                            merged_encoder_seq_lens_cpu[merged_perm]
+                            .contiguous())
+
+                # GDN per-gid override of ``query_start_loc`` /
+                # ``query_start_loc_cpu``. Each dp_rank's
+                # ``gdn_query_start_loc`` is the unpadded version of
+                # its cm_base ``query_start_loc`` (set by
+                # ``_build_attention_metadata`` line 4538-4539 when
+                # the builder is ``GDNAttentionMetadataBuilder``).
+                # NOTE: the standard ``query_start_loc`` and
+                # ``gdn_query_start_loc`` are filled with the
+                # same cumsum in the per-dp_rank path (see
+                # model_runner_v1.py:1395-1407 and 4756-4762);
+                # GDN gid uses ``query_start_loc`` / ``query_start_loc_cpu``
+                # to derive ``query_lens_cpu = qsl[1:] - qsl[:-1]`` for
+                # ``split_decodes_and_prefills`` and reads
+                # ``qsl[-1]`` for ``spec_token_size``. The per-dp_rank
+                # ``gdn_query_start_loc`` (``model_runner_v1.py:1403-1407``)
+                # pads the tail with a CONSTANT
+                # (``cu_num_tokens[-1]``), NOT with the
+                # uniform-decode-style arange that the standard
+                # ``query_start_loc`` may use
+                # (``model_runner_v1.py:1172-1212``). After our
+                # decode-first reorder, the per-req cumsum is the
+                # same as ``merged_query_start_loc_cpu`` (same
+                # ``cu_num_tokens``); we just overwrite the padded
+                # tail (entries >= ``merged_num_reqs + 1``) with the
+                # constant ``merged_num_actual_tokens`` so padded
+                # rows have ``qsl[k+1] - qsl[k] == 0`` (matching
+                # per-dp_rank GDN semantics). Without this, on a
+                # uniform-decode merged batch the GDN gid would see
+                # padded rows with ``qsl_diff = uniform_decode_query_len``
+                # and ``split_decodes_and_prefills`` would
+                # misclassify them.
+                gdn_merged_qsl_cpu = None
+                gdn_merged_qsl = None
+                if isinstance(builder, GDNAttentionMetadataBuilder):
+                    gdn_merged_qsl_cpu = merged_query_start_loc_cpu.clone()
+                    gdn_merged_qsl_cpu[
+                        merged_num_reqs + 1:] = merged_num_actual_tokens
+                    gdn_merged_qsl = gdn_merged_qsl_cpu.to(self.device)
+
+                # Assemble the per-gid merged cm.
+                cm_merged = AscendCommonAttentionMetadata(
+                    query_start_loc=(
+                        gdn_merged_qsl
+                        if gdn_merged_qsl is not None
+                        else merged_query_start_loc),
+                    query_start_loc_cpu=(
+                        gdn_merged_qsl_cpu
+                        if gdn_merged_qsl_cpu is not None
+                        else merged_query_start_loc_cpu),
+                    seq_lens=merged_seq_lens,
+                    seq_lens_cpu=merged_seq_lens_cpu,
+                    num_reqs=merged_num_reqs_padded,
+                    num_actual_tokens=merged_num_actual_tokens,
+                    max_query_len=merged_max_query_len,
+                    max_seq_len=merged_max_seq_len,
+                    block_table_tensor=merged_block_tables,
+                    slot_mapping=merged_slot_mapping,
+                    encoder_seq_lens=merged_encoder_seq_lens,
+                    encoder_seq_lens_cpu=merged_encoder_seq_lens_cpu,
+                    causal=any_cm.causal,
+                    is_prefilling=merged_is_prefilling,
+                    num_input_tokens=merged_num_tokens_padded,
+                    actual_seq_lengths_q=merged_actual_seq_lengths_q,
+                    positions=merged_positions,
+                    positions_cpu=merged_positions_cpu,
+                    attn_state=merged_attn_state,
+                    num_computed_tokens_cpu=(
+                        merged_num_computed_tokens_cpu),
+                    decode_token_per_req=any_cm.decode_token_per_req,
+                    seq_lens_cpu_upper_bound=(
+                        merged_seq_lens_cpu_upper),
+                    _seq_lens_cpu=merged__seq_lens_cpu,
+                )
+
+                # Per-(kv_cache_gid, attn_gid) extras. Read from
+                # ``bundle.per_gid_extra[(k, a)]`` (the
+                # ``(cascade_attn_prefix_len,
+                # extra_attn_metadata_args)`` tuple saved by
+                # ``_build_attn_group_metadata``).
+                merged_cascade_attn_prefix_len = 0
+                merged_extra_args: dict[str, Any] = {}
+                for b in bundles:
+                    cascade_attn_prefix_len, extra_args = (
+                        b.per_gid_extra[(kv_cache_gid, attn_gid)])
+                    merged_cascade_attn_prefix_len += (
+                        cascade_attn_prefix_len)
+                    for k_key, v in extra_args.items():
+                        if k_key in ("num_accepted_tokens",
+                                     "num_decode_draft_tokens_cpu"):
+                            tensors = [
+                                b2.per_gid_extra[
+                                    (kv_cache_gid, attn_gid)][1].get(
+                                        k_key)
+                                for b2 in bundles
+                                if b2.per_gid_extra[(
+                                    kv_cache_gid, attn_gid)][1].get(
+                                        k_key) is not None]
+                            t_cat = torch.cat(
+                                [t[:b2.num_reqs_actual]
+                                 for t, b2 in zip(tensors, bundles)],
+                                dim=0)
+                            if (t_cat.shape[0]
+                                    < merged_num_reqs_padded):
+                                pad = torch.zeros(
+                                    merged_num_reqs_padded
+                                    - t_cat.shape[0],
+                                    dtype=t_cat.dtype,
+                                    device=t_cat.device)
+                                t_cat = torch.cat([t_cat, pad])
+                            elif t_cat.shape[0] > merged_num_reqs_padded:
+                                t_cat = t_cat[:merged_num_reqs_padded]
+                            # Decode-first reorder: per-req
+                            # extra args must follow the merged
+                            # batch layout. In DecodeOnly mode
+                            # the perm is the identity map so
+                            # the slice is skipped.
+                            if need_reorder:
+                                t_cat = t_cat[merged_perm]
+                            merged_extra_args[k_key] = (
+                                t_cat.contiguous())
+                        elif k_key == "num_reqs_actual":
+                            # DSA scalar: sum across dp_ranks.
+                            merged_extra_args[k_key] = (
+                                merged_extra_args.get(k_key, 0) + v)
+                        elif k_key in ("compress_ratio", "block_size"):
+                            # DSA scalar: take-first (uniform).
+                            merged_extra_args.setdefault(k_key, v)
+                        elif k_key.endswith("_ratio_to_sas_metadata"):
+                            # DSA per-builder state: not supported
+                            # in the batched path.
+                            raise NotImplementedError(
+                                f"Layer {attn_group.layer_names[0]}: "
+                                f"DSA {k_key!r} is set on dp_rank "
+                                f"bundle; the batched forward "
+                                f"does not yet support merging "
+                                f"per-builder ratio metadata.")
+                        else:
+                            # Unknown extra arg — pass through the
+                            # first non-None value (defensive).
+                            merged_extra_args.setdefault(k_key, v)
+
+                attn_metadata_i = builder.build(
+                    common_prefix_len=merged_cascade_attn_prefix_len,
+                    common_attn_metadata=cm_merged,
+                    **merged_extra_args)
+                for ln in attn_group.layer_names:
+                    merged_attn_metadata[ln] = attn_metadata_i
+
+        # ---- Step 6: ``merged_input_ids`` /
+        # ``merged_positions`` / ``merged_inputs_embeds`` for
+        # downstream ``_model_forward`` consumption.
         n_actuals = [b.num_actual_tokens for b in bundles]
         if all(b.input_ids is not None for b in bundles):
             merged_input_ids_ctx = torch.cat(
@@ -1250,450 +2268,135 @@ class BatchedModelRunner(NPUModelRunner):
                  for b, n in zip(bundles, n_actuals)])
         else:
             merged_input_ids_ctx = None
-        if all(b.positions is not None for b in bundles):
-            cat_dim_ctx = bundles[0].positions.dim() - 1
-            merged_positions_ctx = torch.cat(
-                [b.positions[..., :n]
-                 for b, n in zip(bundles, n_actuals)],
-                dim=cat_dim_ctx)
-        else:
-            merged_positions_ctx = None
         if all(b.inputs_embeds is not None for b in bundles):
             merged_inputs_embeds_ctx = torch.cat(
                 [b.inputs_embeds[:n]
                  for b, n in zip(bundles, n_actuals)])
         else:
             merged_inputs_embeds_ctx = None
+        # ``merged_positions`` is built from per-dp_rank
+        # ``bundle.positions`` (the same tensor
+        # ``_preprocess`` returned; matches what
+        # ``_model_forward(positions=...)`` reads). Do NOT
+        # source from ``cm.positions`` (AscendCommonAttentionMetadata
+        # may carry a different positions tensor — e.g.
+        # ``mrope_positions`` / ``xdrope_positions`` path) since
+        # ``forward`` consumes the buffer we write here, not the
+        # metadata field.
+        if all(b.positions is not None for b in bundles):
+            cat_dim = bundles[0].positions.dim() - 1
+            merged_positions_ctx = torch.cat(
+                [b.positions[..., :n]
+                 for b, n in zip(bundles, n_actuals)],
+                dim=cat_dim)
+        else:
+            merged_positions_ctx = None
+        # Decode-first reorder: ``input_ids`` / ``inputs_embeds``
+        # are per-token. Apply ``merged_token_perm`` over the
+        # actual range so the per-token order matches the
+        # reordered ``query_start_loc`` / ``positions`` /
+        # ``slot_mapping``. In DecodeOnly mode the perm is the
+        # identity map so the slice is skipped.
+        if (merged_input_ids_ctx is not None
+                and merged_num_actual_tokens > 0
+                and need_reorder):
+            merged_input_ids_ctx_actual = (
+                merged_input_ids_ctx[:merged_num_actual_tokens][
+                    merged_token_perm])
+            merged_input_ids_ctx = torch.cat([
+                merged_input_ids_ctx_actual,
+                merged_input_ids_ctx[merged_num_actual_tokens:],
+            ])
+        if (merged_inputs_embeds_ctx is not None
+                and merged_num_actual_tokens > 0
+                and need_reorder):
+            merged_inputs_embeds_ctx_actual = (
+                merged_inputs_embeds_ctx[:merged_num_actual_tokens][
+                    merged_token_perm])
+            merged_inputs_embeds_ctx = torch.cat([
+                merged_inputs_embeds_ctx_actual,
+                merged_inputs_embeds_ctx[merged_num_actual_tokens:],
+            ])
+        if (merged_positions_ctx is not None
+                and merged_num_actual_tokens > 0
+                and need_reorder):
+            merged_positions_ctx_actual = (
+                merged_positions_ctx[..., :merged_num_actual_tokens][
+                    ..., merged_token_perm])
+            merged_positions_ctx = torch.cat([
+                merged_positions_ctx_actual,
+                merged_positions_ctx[..., merged_num_actual_tokens:],
+            ], dim=-1)
+        # FULL mode: copy ``input_ids`` / ``inputs_embeds`` to
+        # leader runner's pre-allocated buffers so
+        # ``_model_forward(input_ids=..., inputs_embeds=...)``
+        # share stable device pointers across cudagraph
+        # captures. ``positions`` was already copied in Step 4
+        # (FULL mode path) — reuse ``self.positions[:n]`` here
+        # instead of re-cating.
+        if merged_cudagraph_mode == CUDAGraphMode.FULL:
+            if merged_input_ids_ctx is not None:
+                # Pad the tail (beyond ``merged_num_actual_tokens``)
+                # with 0 so the pre-allocated buffer's padding
+                # carries a deterministic value instead of
+                # whatever stale bytes were left from a previous
+                # round. The leading actual rows are then
+                # overwritten with the merged cat output.
+                self.input_ids.gpu[
+                    merged_num_actual_tokens:merged_num_tokens_padded
+                ].fill_(0)
+                self.input_ids.gpu[:merged_num_actual_tokens].copy_(
+                    merged_input_ids_ctx)
+                merged_input_ids_ctx = (
+                    self.input_ids.gpu[:merged_num_tokens_padded])
+            if merged_inputs_embeds_ctx is not None:
+                self.inputs_embeds.gpu[
+                    merged_num_actual_tokens:merged_num_tokens_padded
+                ].fill_(0)
+                self.inputs_embeds.gpu[:merged_num_actual_tokens].copy_(
+                    merged_inputs_embeds_ctx)
+                merged_inputs_embeds_ctx = (
+                    self.inputs_embeds.gpu[:merged_num_tokens_padded])
+            if merged_positions_ctx is not None:
+                # Match the buffer that ``_preprocess`` /
+                # ``_build_attention_metadata`` uses to source
+                # positions — plain / mrope / xdrope — so that
+                # ``_model_forward(positions=...)`` reads back the
+                # same buffer it would in the standard path.
+                if self.uses_mrope:
+                    pos_buf = self.mrope_positions.gpu[
+                        :, :merged_num_tokens_padded]
+                    pos_buf[:, merged_num_actual_tokens:
+                            merged_num_tokens_padded].fill_(0)
+                    pos_buf[:, :merged_num_actual_tokens].copy_(
+                        merged_positions_ctx)
+                elif self.uses_xdrope_dim > 0:
+                    pos_buf = self.xdrope_positions.gpu[
+                        :, :merged_num_tokens_padded]
+                    pos_buf[:, merged_num_actual_tokens:
+                            merged_num_tokens_padded].fill_(0)
+                    pos_buf[:, :merged_num_actual_tokens].copy_(
+                        merged_positions_ctx)
+                else:
+                    pos_buf = self.positions[
+                        :merged_num_tokens_padded]
+                    pos_buf[merged_num_actual_tokens:
+                            merged_num_tokens_padded].fill_(0)
+                    pos_buf[:merged_num_actual_tokens].copy_(
+                        merged_positions_ctx)
+                merged_positions_ctx = pos_buf
 
         ctx = _MergedAttnContext(
             merged_attn_metadata=merged_attn_metadata,
             merged_batch_descriptor=merged_batch_descriptor,
-            num_tokens_padded_merged=num_tokens_padded_merged,
+            merged_cudagraph_mode=merged_cudagraph_mode,
+            num_tokens_padded_merged=merged_num_tokens_padded,
             merged_input_ids=merged_input_ids_ctx,
             merged_positions=merged_positions_ctx,
             merged_inputs_embeds=merged_inputs_embeds_ctx,
+            merged_token_perm=merged_token_perm,
+            inv_merged_token_perm=inv_merged_token_perm,
         )
         self._merged_attn_ctx_cache = ctx
         return ctx
 
-    def _merge_layer_attn(
-        self,
-        layer_name: str,
-        bundles: list["_ExecuteModelBundle"],
-        batched_dp_ranks: list[int],
-        per_dp_offsets: dict[int, int],
-        bpb: int,
-    ) -> Any:
-        """Merge one layer's ``AscendMetadata`` across dp_ranks.
-
-        Field-by-field strategy (see design doc §4.5):
-        - cumsum: ``query_start_loc``
-        - concat: ``seq_lens`` / ``seq_lens_cpu``
-        - concat + per-dp_rank remap: ``block_tables`` /
-          ``slot_mapping``
-        - sum / max: ``num_actual_tokens`` / ``num_decode_tokens`` /
-          ``num_prefills`` / ``num_decodes`` / ``max_query_len``
-
-        Per-dp_rank-identical fields (``attn_state`` / ``causal`` /
-        ``model_runner_type``) fall through from the first bundle.
-        """
-        from vllm_ascend.attention.attention_v1 import AscendMetadata
-
-        def _layer_md(b: "_ExecuteModelBundle") -> Any:
-            d = b.attn_metadata
-            return d[0][layer_name] if isinstance(d, list) else (
-                d[layer_name])
-
-        any_md = _layer_md(bundles[0])
-        per_layer_mds = [_layer_md(b) for b in bundles]
-
-        # Unify ``attn_state`` across dp_ranks.
-        states = [md.attn_state for md in per_layer_mds]
-        unique_states = set(states)
-        if len(unique_states) > 1:
-            if AscendAttentionState.SpecDecoding in unique_states:
-                raise NotImplementedError(
-                    f"Layer {layer_name}: cannot merge SpecDecoding "
-                    f"with other states {unique_states}; SpecDecoding "
-                    f"uses a separate tree path that the batched "
-                    f"forward does not yet support")
-            merged_attn_state = AscendAttentionState.ChunkedPrefill
-        else:
-            merged_attn_state = next(iter(unique_states))
-
-        if self._is_c8_attn_layer(layer_name):
-            raise NotImplementedError(
-                f"Layer {layer_name}: C8 (INT8 KV cache) backend "
-                "does not yet support batched forward; fall back "
-                "to per-dp_rank execution for this layer.")
-
-        for b in bundles[1:]:
-            md = _layer_md(b)
-            for f in ("causal", "model_runner_type", "attn_mask"):
-                lhs = getattr(md, f)
-                rhs = getattr(any_md, f)
-                if (isinstance(lhs, torch.Tensor)
-                        or isinstance(rhs, torch.Tensor)):
-                    if not torch.equal(lhs, rhs):
-                        raise RuntimeError(
-                            f"Layer {layer_name}: dp_rank "
-                            f"b.attn_metadata[{f!r}] disagrees across "
-                            f"dp_ranks; cannot merge for batched "
-                            f"forward")
-                elif lhs != rhs:
-                    raise RuntimeError(
-                        f"Layer {layer_name}: dp_rank "
-                        f"b.attn_metadata[{f!r}] disagrees across "
-                        f"dp_ranks; cannot merge for batched forward")
-        for f in ("prefill", "decode_meta", "reshape_cache_event",
-                  "kvcomp_metadata"):
-            if any(getattr(_layer_md(b), f) is not None
-                   for b in bundles):
-                raise NotImplementedError(
-                    f"Layer {layer_name}: {f!r} is set on at least "
-                    f"one dp_rank; batched forward does not yet "
-                    f"support merging this field.")
-
-        # 1. query_start_loc (cumsum token offsets).
-        merged_query_start_loc = [0]
-        for b in bundles:
-            md = _layer_md(b)
-            n_reqs = md.seq_lens.shape[0]
-            if n_reqs > 0:
-                local = md.query_start_loc[1:n_reqs + 1]
-                cumulative = local + merged_query_start_loc[-1]
-                merged_query_start_loc.extend(cumulative.tolist())
-            else:
-                merged_query_start_loc.append(
-                    merged_query_start_loc[-1])
-        merged_query_start_loc = torch.tensor(
-            merged_query_start_loc, dtype=torch.int32,
-            device=self.device)
-
-        # 2. seq_lens (concat).
-        merged_seq_lens = torch.cat(
-            [_layer_md(b).seq_lens for b in bundles])
-        merged_seq_lens_cpu = (
-            torch.cat([_layer_md(b).seq_lens_cpu for b in bundles])
-            if any_md.seq_lens_cpu is not None else None)
-
-        # 3. block_tables (concat + remap).
-        dp_size = self.parallel_config.data_parallel_size
-        merged_block_tables = torch.cat([
-            torch.where(
-                _layer_md(b).block_tables == 0,
-                _layer_md(b).block_tables,
-                ((_layer_md(b).block_tables // bpb) * dp_size
-                 + per_dp_offsets[k]) * bpb
-                + (_layer_md(b).block_tables % bpb),
-            )
-            for b, k in zip(bundles, batched_dp_ranks)
-        ])
-
-        # 4. slot_mapping (concat + remap).
-        bs = self.block_size
-        merged_slot_mapping = torch.cat([
-            torch.where(
-                _layer_md(b).slot_mapping == PAD_SLOT_ID,
-                _layer_md(b).slot_mapping,
-                ((_layer_md(b).slot_mapping // bs) * dp_size
-                 + per_dp_offsets[k]) * bs
-                + (_layer_md(b).slot_mapping % bs),
-            )
-            for b, k in zip(bundles, batched_dp_ranks)
-        ])
-
-        # 5. actual_seq_lengths_q (cu_seqlen of merged batch).
-        merged_actual_seq_lengths_q = (
-            merged_query_start_loc[1:].tolist())
-
-        # 6. Scalars.
-        merged_num_actual_tokens_pcp_padded = sum(
-            _layer_md(b).num_actual_tokens_pcp_padded
-            for b in bundles)
-        merged_num_actual_tokens = sum(
-            _layer_md(b).num_actual_tokens for b in bundles)
-        merged_num_decode_tokens = sum(
-            _layer_md(b).num_decode_tokens for b in bundles)
-        merged_num_prefills = sum(
-            _layer_md(b).num_prefills for b in bundles)
-        merged_num_decodes = sum(
-            _layer_md(b).num_decodes for b in bundles)
-        merged_num_decodes_flatten = sum(
-            _layer_md(b).num_decodes_flatten for b in bundles)
-        merged_max_query_len = max(
-            _layer_md(b).max_query_len or 0 for b in bundles)
-
-        return AscendMetadata(
-            num_actual_tokens_pcp_padded=(
-                merged_num_actual_tokens_pcp_padded),
-            num_actual_tokens=merged_num_actual_tokens,
-            num_decode_tokens=merged_num_decode_tokens,
-            num_prefills=merged_num_prefills,
-            num_decodes=merged_num_decodes,
-            num_decodes_flatten=merged_num_decodes_flatten,
-            seq_lens=merged_seq_lens,
-            seq_lens_cpu=merged_seq_lens_cpu,
-            seq_lens_list=merged_seq_lens.cpu().tolist(),
-            actual_seq_lengths_q=merged_actual_seq_lengths_q,
-            query_start_loc=merged_query_start_loc,
-            max_query_len=merged_max_query_len,
-            block_tables=merged_block_tables,
-            slot_mapping=merged_slot_mapping,
-            attn_mask=any_md.attn_mask,
-            attn_state=merged_attn_state,
-            causal=any_md.causal,
-            model_runner_type=any_md.model_runner_type,
-        )
-
-    def _merge_gdn_layer_attn(
-        self,
-        layer_name: str,
-        bundles: list["_ExecuteModelBundle"],
-        batched_dp_ranks: list[int],
-        per_dp_offsets: dict[int, int],
-        bpb: int,
-    ) -> Any:
-        """Merge one layer's ``GDNAttentionMetadata`` across dp_ranks.
-
-        See ``non_embedding_only_support.md`` §3 for the 21-field
-        strategy (scalar sums, per-request cat, cu_seqlen cumsum
-        with offset, token-indices shift, mamba state-indices
-        remap, derived-from-cu_seqlen fallback).
-        """
-        from vllm.v1.attention.backends.gdn_attn import (
-            GDNAttentionMetadata,
-        )
-
-        def _layer_md(b: "_ExecuteModelBundle") -> Any:
-            d = b.attn_metadata
-            return d[0][layer_name] if isinstance(d, list) else (
-                d[layer_name])
-
-        any_md = _layer_md(bundles[0])
-        per_layer_mds = [_layer_md(b) for b in bundles]
-
-        # A. scalar sums.
-        merged_num_prefills = sum(
-            _layer_md(b).num_prefills for b in bundles)
-        merged_num_prefill_tokens = sum(
-            _layer_md(b).num_prefill_tokens for b in bundles)
-        merged_num_decodes = sum(
-            _layer_md(b).num_decodes for b in bundles)
-        merged_num_decode_tokens = sum(
-            _layer_md(b).num_decode_tokens for b in bundles)
-        merged_num_spec_decodes = sum(
-            _layer_md(b).num_spec_decodes for b in bundles)
-        merged_num_spec_decode_tokens = sum(
-            _layer_md(b).num_spec_decode_tokens for b in bundles)
-        merged_num_actual_tokens = sum(
-            _layer_md(b).num_actual_tokens for b in bundles)
-
-        # B. per-request tensors (concat dim=0).
-        def _cat_or_none(getter):
-            values = [getter(_layer_md(b)) for b in bundles]
-            if all(v is None for v in values):
-                return None
-            if any(v is None for v in values):
-                raise NotImplementedError(
-                    f"Layer {layer_name}: field is None on some "
-                    f"dp_ranks and non-None on others; batched "
-                    f"forward requires uniform None-ness.")
-            return torch.cat(values)
-
-        device = self.device
-        parts: list[torch.Tensor] = []
-        for md in per_layer_mds:
-            n_non_spec = md.num_decodes + md.num_prefills
-            if md.has_initial_state is not None:
-                parts.append(md.has_initial_state)
-            elif n_non_spec > 0:
-                parts.append(
-                    torch.ones(n_non_spec, dtype=torch.bool,
-                               device=device))
-        merged_has_initial_state = (
-            torch.cat(parts) if parts else None)
-        merged_spec_sequence_masks = _cat_or_none(
-            lambda md: md.spec_sequence_masks)
-        merged_num_accepted_tokens = _cat_or_none(
-            lambda md: md.num_accepted_tokens)
-
-        # E. mamba state indices (cat, with block_id remap).
-        dp_size = self.parallel_config.data_parallel_size
-
-        def _remap_state_indices(getter):
-            values = [getter(_layer_md(b)) for b in bundles]
-            if all(v is None for v in values):
-                return None
-            if any(v is None for v in values):
-                raise NotImplementedError(
-                    f"Layer {layer_name}: state indices are None on "
-                    f"some dp_ranks and non-None on others; batched "
-                    f"forward requires uniform None-ness.")
-            return torch.cat([
-                ((v // bpb) * dp_size + per_dp_offsets[k]) * bpb
-                + (v % bpb)
-                for v, k in zip(values, batched_dp_ranks)
-            ])
-
-        merged_spec_state_indices_tensor = _remap_state_indices(
-            lambda md: md.spec_state_indices_tensor)
-        merged_non_spec_state_indices_tensor = _remap_state_indices(
-            lambda md: md.non_spec_state_indices_tensor)
-
-        # D. token indices (cat + prior_token_count offset).
-        prior_token_count = 0
-        spec_token_indx_parts = []
-        non_spec_token_indx_parts = []
-        for b in bundles:
-            md = _layer_md(b)
-            if md.spec_token_indx is not None:
-                spec_token_indx_parts.append(
-                    md.spec_token_indx + prior_token_count)
-            if md.non_spec_token_indx is not None:
-                non_spec_token_indx_parts.append(
-                    md.non_spec_token_indx + prior_token_count)
-            prior_token_count += md.num_actual_tokens
-        merged_spec_token_indx = (
-            torch.cat(spec_token_indx_parts)
-            if spec_token_indx_parts else None)
-        merged_non_spec_token_indx = (
-            torch.cat(non_spec_token_indx_parts)
-            if non_spec_token_indx_parts else None)
-
-        # C. cu_seqlen-style (cumsum concat with prior offset).
-        prior_spec_count = 0
-        spec_qsl_parts = []
-        for b in bundles:
-            md = _layer_md(b)
-            if md.spec_query_start_loc is None:
-                continue
-            n = md.num_spec_decodes
-            if n > 0:
-                local = md.spec_query_start_loc[1:n + 1]
-                spec_qsl_parts.append(local + prior_spec_count)
-                prior_spec_count += int(
-                    md.spec_query_start_loc[n].item())
-        if spec_qsl_parts or any(
-                _layer_md(b).spec_query_start_loc is None
-                for b in bundles):
-            merged_spec_query_start_loc = (
-                torch.cat(
-                    [torch.zeros(1, dtype=torch.int32,
-                                 device=self.device)]
-                    + spec_qsl_parts)
-                if spec_qsl_parts else None)
-        else:
-            merged_spec_query_start_loc = None
-
-        prior_non_spec_count = 0
-        non_spec_qsl_parts = []
-        for b in bundles:
-            md = _layer_md(b)
-            if md.non_spec_query_start_loc is None:
-                continue
-            n = md.num_decodes + md.num_prefills
-            if n > 0:
-                local = md.non_spec_query_start_loc[1:n + 1]
-                non_spec_qsl_parts.append(
-                    local + prior_non_spec_count)
-                prior_non_spec_count += int(
-                    md.non_spec_query_start_loc[n].item())
-        merged_non_spec_query_start_loc = (
-            torch.cat(
-                [torch.zeros(1, dtype=torch.int32,
-                             device=self.device)]
-                + non_spec_qsl_parts)
-            if non_spec_qsl_parts else None)
-
-        # F-class: leave as None (the patched Ascend forward path
-        # reads the ``*_fallback_meta`` set by the sub-patchers below,
-        # not these dataclass fields).
-        merged_chunk_indices = None
-        merged_chunk_offsets = None
-        merged_nums_dict = None
-        merged_batch_ptr = None
-        merged_token_chunk_offset_ptr = None
-
-        # Run the three ``_patched_build_*`` sub-patchers (mirrors
-        # ``_patched_build`` patch_gdn_attn.py:709-750).
-        if (merged_num_prefills > 0 or merged_num_decodes > 0
-                or merged_num_spec_decodes > 0):
-            from vllm_ascend.patch.worker.patch_gdn_attn import (
-                _patched_build_decode,
-                _patched_build_prefill,
-                _patched_build_spec,
-            )
-
-            builder = None
-            for attn_group_list in self.attn_groups:
-                for attn_group in attn_group_list:
-                    if layer_name in attn_group.layer_names:
-                        builder = attn_group.get_metadata_builder(0)
-                        break
-                if builder is not None:
-                    break
-            assert builder is not None, (
-                f"GDN builder not found for layer {layer_name!r}")
-
-            # Reconstruct merged full cu_seqlen (non-spec first,
-            # then spec — matches ``argsort(spec_token_masks,
-            # stable=True)`` ordering in ``_ORIGINAL_BUILD``
-            # gdn_attn.py:271).
-            n_non_spec = merged_num_decodes + merged_num_prefills
-            non_spec_cumsum_cpu = (
-                merged_non_spec_query_start_loc.cpu())
-            if merged_spec_query_start_loc is not None:
-                spec_cumsum_cpu = (
-                    merged_spec_query_start_loc.cpu())
-                merged_full_cumsum_cpu = torch.cat([
-                    non_spec_cumsum_cpu,
-                    spec_cumsum_cpu[1:] + non_spec_cumsum_cpu[-1],
-                ])
-            else:
-                merged_full_cumsum_cpu = non_spec_cumsum_cpu
-            # Per-req spec flag: ``-1`` non-spec, ``0`` spec.
-            merged_nddt_cpu = torch.cat([
-                torch.full((n_non_spec,), -1, dtype=torch.int32),
-                torch.zeros(merged_num_spec_decodes,
-                            dtype=torch.int32),
-            ])
-
-            common_stub = _StubCommonAttnMetadata(
-                query_start_loc=torch.empty(0, device=self.device),
-                query_start_loc_cpu=merged_full_cumsum_cpu,
-                num_decode_draft_tokens_cpu=merged_nddt_cpu,
-            )
-
-        attn_metadata = GDNAttentionMetadata(
-            num_prefills=merged_num_prefills,
-            num_prefill_tokens=merged_num_prefill_tokens,
-            num_decodes=merged_num_decodes,
-            num_decode_tokens=merged_num_decode_tokens,
-            num_spec_decodes=merged_num_spec_decodes,
-            num_spec_decode_tokens=merged_num_spec_decode_tokens,
-            num_actual_tokens=merged_num_actual_tokens,
-            has_initial_state=merged_has_initial_state,
-            spec_query_start_loc=merged_spec_query_start_loc,
-            non_spec_query_start_loc=merged_non_spec_query_start_loc,
-            spec_state_indices_tensor=merged_spec_state_indices_tensor,
-            non_spec_state_indices_tensor=(
-                merged_non_spec_state_indices_tensor),
-            spec_sequence_masks=merged_spec_sequence_masks,
-            spec_token_indx=merged_spec_token_indx,
-            non_spec_token_indx=merged_non_spec_token_indx,
-            num_accepted_tokens=merged_num_accepted_tokens,
-            chunk_indices=merged_chunk_indices,
-            chunk_offsets=merged_chunk_offsets,
-            nums_dict=merged_nums_dict,
-            batch_ptr=merged_batch_ptr,
-            token_chunk_offset_ptr=merged_token_chunk_offset_ptr,
-        )
-        if merged_num_spec_decodes > 0:
-            _patched_build_spec(builder, attn_metadata, common_stub)
-        if merged_num_prefills > 0:
-            _patched_build_prefill(builder, attn_metadata, common_stub)
-        if merged_num_decodes > 0:
-            _patched_build_decode(builder, attn_metadata, common_stub)
-        attn_metadata.skip_graph_params_update = True
-        return attn_metadata

@@ -312,8 +312,7 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
             "intermediate_tensors is None in MTP edge-cloud segment; "
             "check that all TP ranks receive tensors correctly."
         )
-        hidden_states = intermediate_tensors["hidden_states"]
-        residual = intermediate_tensors["residual"]
+        hidden_states, residual = restore_boundary_state(self, intermediate_tensors)
 
     # Cloud segment: execute exactly one decoder layer selected by spec_step_idx.
     if not is_first_segment and not is_last_segment:
@@ -325,12 +324,9 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
         )
 
     if not is_last_segment:
-        return IntermediateTensors(
-            {"hidden_states": hidden_states, "residual": residual}
-        )
+        return make_boundary_tensors(self, hidden_states, residual)
 
-    hidden_states, _ = self.norm(hidden_states, residual)
-    return hidden_states
+    return apply_final_norm(self.norm, hidden_states, residual)
 
 
 def _qwen3_5_mtp_forward_edge_cloud_segment(

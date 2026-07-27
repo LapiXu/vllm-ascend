@@ -66,6 +66,9 @@ from vllm_ascend.distributed.parallel_state import (
     init_ascend_model_parallel,
     init_edge_cloud_tensor_meta,
 )
+from vllm_ascend.edge_cloud_materialized import (
+    supports_materialized_boundary_for_config,
+)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -113,6 +116,10 @@ def _detect_has_residual(model_config) -> bool:
     # Default: most modern decoder models produce residual
     # Can be made more specific as more models are supported
     return True
+
+
+def _use_materialized_residual_boundary(model_config) -> bool:
+    return supports_materialized_boundary_for_config(model_config)
 
 
 class NPUWorker(WorkerBase):
@@ -384,6 +391,9 @@ class NPUWorker(WorkerBase):
                 hc_mult=hc_mult,
                 mode=self.model_runner.edge_cloud_cfg.mode,
                 uses_mrope=self.model_config.uses_mrope,
+                materialize_residual_boundary=(
+                    _use_materialized_residual_boundary(self.model_config)
+                ),
             )
 
     @torch.inference_mode()

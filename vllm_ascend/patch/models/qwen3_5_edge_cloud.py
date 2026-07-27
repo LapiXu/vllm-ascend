@@ -26,6 +26,11 @@ from vllm.model_executor.models.qwen3_5_mtp import (
     Qwen3_5MultiTokenPredictor,
 )
 from vllm.sequence import IntermediateTensors
+from vllm_ascend.edge_cloud_materialized import (
+    apply_final_norm,
+    make_boundary_tensors,
+    restore_boundary_state,
+)
 
 
 def _forward_edge_cloud_segment_qwen3_5(
@@ -61,8 +66,7 @@ def _forward_edge_cloud_segment_qwen3_5(
             "intermediate_tensors is None in edge-cloud segment; "
             "check that all TP ranks receive tensors correctly."
         )
-        hidden_states = intermediate_tensors["hidden_states"]
-        residual = intermediate_tensors["residual"]
+        hidden_states, residual = restore_boundary_state(self, intermediate_tensors)
 
     for layer in islice(self.layers, start_layer, end_layer):
         hidden_states, residual = layer(
@@ -73,14 +77,9 @@ def _forward_edge_cloud_segment_qwen3_5(
         )
 
     if not is_last_segment:
-        if residual is None:
-            residual = torch.zeros_like(hidden_states)
-        return IntermediateTensors(
-            {"hidden_states": hidden_states, "residual": residual}
-        )
+        return make_boundary_tensors(self, hidden_states, residual)
 
-    hidden_states, _ = self.norm(hidden_states, residual)
-    return hidden_states
+    return apply_final_norm(self.norm, hidden_states, residual)
 
 
 def _qwen3_5_lm_forward_edge_cloud_segment(

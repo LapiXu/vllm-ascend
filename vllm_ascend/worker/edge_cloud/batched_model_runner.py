@@ -53,6 +53,10 @@ from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.utils import (
     vllm_version_is,
 )
+from vllm_ascend.edge_cloud_materialized import (
+    make_boundary_tensors,
+    uses_materialized_boundary,
+)
 from vllm_ascend.worker.edge_cloud.execute_model_bundle import (
     _ExecuteModelBundle,
     _MergedAttnContext,
@@ -970,7 +974,11 @@ class BatchedModelRunner(NPUModelRunner):
             )
 
         head_hidden = hidden_states["hidden_states"]
-        head_residual = hidden_states["residual"]
+        # Materialized-boundary models (e.g. qwen3_5) merge residual
+        # into hidden_states, so the head output carries no ``residual``
+        # key. Use ``.get`` and gate all residual handling on it.
+        materialized = uses_materialized_boundary(self.model)
+        head_residual = None if materialized else hidden_states.get("residual")
         # Undo the decode-first token reorder so per-dp_rank
         # slicing produces hidden_states in cat-order
         # (``scheduler_output`` order) — the cloud middle
@@ -983,11 +991,12 @@ class BatchedModelRunner(NPUModelRunner):
                     inv_merged_token_perm],
                 head_hidden[inv_merged_token_perm.shape[0]:],
             ])
-            head_residual = torch.cat([
-                head_residual[:inv_merged_token_perm.shape[0]][
-                    inv_merged_token_perm],
-                head_residual[inv_merged_token_perm.shape[0]:],
-            ])
+            if head_residual is not None:
+                head_residual = torch.cat([
+                    head_residual[:inv_merged_token_perm.shape[0]][
+                        inv_merged_token_perm],
+                    head_residual[inv_merged_token_perm.shape[0]:],
+                ])
         token_offsets = [0]
         for n in n_actuals:
             token_offsets.append(token_offsets[-1] + n)
@@ -995,8 +1004,8 @@ class BatchedModelRunner(NPUModelRunner):
         for i, b in enumerate(bundles):
             slice_hs = head_hidden[
                 token_offsets[i]:token_offsets[i + 1]]
-            slice_res = head_residual[
-                token_offsets[i]:token_offsets[i + 1]]
+            slice_res = (None if head_residual is None else head_residual[
+                token_offsets[i]:token_offsets[i + 1]])
             if (self.edge_cloud_cfg.mode == "embedding_only"
                     and slice_hs.shape[0] < self.max_num_tokens):
                 pad = torch.zeros(
@@ -1006,12 +1015,10 @@ class BatchedModelRunner(NPUModelRunner):
                     device=slice_hs.device,
                 )
                 slice_hs = torch.cat([slice_hs, pad], dim=0)
-                slice_res = torch.cat([slice_res, pad], dim=0)
+                if slice_res is not None:
+                    slice_res = torch.cat([slice_res, pad], dim=0)
             results.append(
-                IntermediateTensors({
-                    "hidden_states": slice_hs,
-                    "residual": slice_res,
-                }))
+                make_boundary_tensors(self.model, slice_hs, slice_res))
         return results
 
     @torch.inference_mode()
@@ -1045,7 +1052,14 @@ class BatchedModelRunner(NPUModelRunner):
                  for it, n in zip(intermediates, n_actuals_tail)])
         else:
             merged_hidden = None
-        if all(it["residual"] is not None for it in intermediates):
+        # Materialized-boundary models (e.g. qwen3_5) carry no
+        # ``residual`` key — the residual was already merged into
+        # hidden_states. Skip residual merging entirely for them and
+        # use ``.get`` so a missing key never raises.
+        materialized = uses_materialized_boundary(self.model)
+        if (not materialized
+                and all(it.get("residual") is not None
+                        for it in intermediates)):
             merged_residual = torch.cat(
                 [it["residual"][:n]
                  for it, n in zip(intermediates, n_actuals_tail)])
@@ -1102,10 +1116,20 @@ class BatchedModelRunner(NPUModelRunner):
             merged_token_perm = None
             inv_merged_token_perm = None
 
-        merged_intermediate = IntermediateTensors({
-            "hidden_states": merged_hidden,
-            "residual": merged_residual,
-        })
+        # Build with materialized-boundary awareness: for materialized
+        # models this yields a ``hidden_states``-only IntermediateTensors
+        # (merged_residual is None here), matching the tail forward's
+        # expectation. Non-materialized models keep both keys.
+        # Guard the degenerate merged_hidden is None case (all cloud
+        # intermediates empty) to preserve the original tolerant shape.
+        if merged_hidden is None:
+            merged_intermediate = IntermediateTensors({
+                "hidden_states": merged_hidden,
+                "residual": merged_residual,
+            })
+        else:
+            merged_intermediate = make_boundary_tensors(
+                self.model, merged_hidden, merged_residual)
 
         token_offsets = [0]
         for n in n_actuals_tail:

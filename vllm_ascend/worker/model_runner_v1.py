@@ -4743,14 +4743,23 @@ class NPUModelRunner(GPUModelRunner):
             if _edge_debug_enabled("logits"):
                 try:
                     _l = logits
-                    _eos = self.model_config.hf_config.eos_token_id
+                    # eos_token_id 在不同 config 层级，逐个兜底查找
+                    _eos = (
+                        getattr(self.model_config.hf_config, "eos_token_id", None)
+                        or getattr(
+                            getattr(self.model_config.hf_config,
+                                    "text_config", None),
+                            "eos_token_id", None)
+                        or getattr(self.model_config.hf_text_config,
+                                   "eos_token_id", None)
+                    )
                     _eos_ids = _eos if isinstance(_eos, (list, tuple)) else [_eos]
                     _row0 = _l[0].float()
                     _topv, _topi = _row0.topk(5)
                     _eos_str = ", ".join(
                         f"id={e}:logit={_row0[e].item():.4f}"
                         for e in _eos_ids if e is not None and e < _row0.shape[0]
-                    )
+                    ) or f"eos_token_id={_eos!r}(unresolved)"
                     _edge_debug_log(
                         "logits",
                         _edge_debug_tensor("logits", _l)
@@ -6389,7 +6398,12 @@ class NPUModelRunner(GPUModelRunner):
                 self.num_layers,
             ))
             # [EDGE-DEBUG] ① segment_e 的输入（cloud 返回并 recv 到的中间张量）
-            if _edge_debug_enabled("seg_e_in"):
+            # 跳过 warmup（profile_run / cudagraph 捕获），把配额留给真实请求。
+            _is_warmup = (
+                getattr(forward_context, "in_profile_run", False)
+                or getattr(forward_context, "capturing", False)
+            )
+            if not _is_warmup and _edge_debug_enabled("seg_e_in"):
                 _it = intermediate_tensors
                 _hs = _it["hidden_states"] if _it is not None else None
                 _rs = _it["residual"] if _it is not None else None
@@ -6405,7 +6419,7 @@ class NPUModelRunner(GPUModelRunner):
                 **model_kwargs,
             )
             # [EDGE-DEBUG] ② segment_e 的输出（tail 层 + norm 后的 hidden_states）
-            if _edge_debug_enabled("seg_e_out"):
+            if not _is_warmup and _edge_debug_enabled("seg_e_out"):
                 _out = hidden_states
                 if isinstance(_out, IntermediateTensors):
                     _out = _out["hidden_states"]

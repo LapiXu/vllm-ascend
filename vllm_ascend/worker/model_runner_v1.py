@@ -6402,6 +6402,7 @@ class NPUModelRunner(GPUModelRunner):
             _is_warmup = (
                 getattr(forward_context, "in_profile_run", False)
                 or getattr(forward_context, "capturing", False)
+                or getattr(_monitor, "cudagraph_capturing_enabled", False)
             )
             if not _is_warmup and _edge_debug_enabled("seg_e_in"):
                 _it = intermediate_tensors

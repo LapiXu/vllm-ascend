@@ -241,6 +241,50 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
+# ============================ [EDGE-DEBUG] ============================
+# 边界诊断日志：仅在环境变量 EDGE_DEBUG_FIRST=1 时启用。用于定位
+# "首一尾一首次请求 content 为空" 问题——在 edge 侧 segment_e 输入/输出、
+# 采样前 logits 三个边界打印张量统计量，判断数据在哪一段变坏。
+# 只打印前 EDGE_DEBUG_MAX_STEPS 次调用（默认 3），避免刷屏。验证完可删。
+_EDGE_DEBUG_FIRST = os.environ.get("EDGE_DEBUG_FIRST", "0") == "1"
+_EDGE_DEBUG_MAX_STEPS = int(os.environ.get("EDGE_DEBUG_MAX_STEPS", "3"))
+_EDGE_DEBUG_COUNTERS: dict[str, int] = {}
+
+
+def _edge_debug_enabled(tag: str) -> bool:
+    """Return True while tag has been logged fewer than the step budget."""
+    if not _EDGE_DEBUG_FIRST:
+        return False
+    n = _EDGE_DEBUG_COUNTERS.get(tag, 0)
+    if n >= _EDGE_DEBUG_MAX_STEPS:
+        return False
+    _EDGE_DEBUG_COUNTERS[tag] = n + 1
+    return True
+
+
+def _edge_debug_tensor(name: str, t: Any) -> str:
+    """One-line stats for a tensor (or None) — cheap, host-sync only on stats."""
+    try:
+        if t is None:
+            return f"{name}=None"
+        if not isinstance(t, torch.Tensor):
+            return f"{name}=<{type(t).__name__}>"
+        tf = t.float()
+        return (
+            f"{name}[shape={tuple(t.shape)},dtype={t.dtype}] "
+            f"mean={tf.mean().item():.5f} absmax={tf.abs().max().item():.5f} "
+            f"nan={bool(torch.isnan(tf).any().item())} "
+            f"allzero={bool((t == 0).all().item())}"
+        )
+    except Exception as e:  # never let debug logging break the run
+        return f"{name}=<stat-error:{e}>"
+
+
+def _edge_debug_log(tag: str, msg: str) -> None:
+    logger.info("[EDGE-DEBUG][%s] %s", tag, msg)
+# ========================== [/EDGE-DEBUG] ============================
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -4695,6 +4739,28 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to(self.device).to(logits_dtype)
 
         with record_function_or_nullcontext("sample_token"):
+            # [EDGE-DEBUG] ③ 采样前 logits：看 argmax 是否落在 EOS，以及 EOS 的 logit 值
+            if _edge_debug_enabled("logits"):
+                try:
+                    _l = logits
+                    _eos = self.model_config.hf_config.eos_token_id
+                    _eos_ids = _eos if isinstance(_eos, (list, tuple)) else [_eos]
+                    _row0 = _l[0].float()
+                    _topv, _topi = _row0.topk(5)
+                    _eos_str = ", ".join(
+                        f"id={e}:logit={_row0[e].item():.4f}"
+                        for e in _eos_ids if e is not None and e < _row0.shape[0]
+                    )
+                    _edge_debug_log(
+                        "logits",
+                        _edge_debug_tensor("logits", _l)
+                        + f" | argmax={int(_row0.argmax().item())}"
+                        + f" | top5_id={_topi.tolist()} top5_logit="
+                        + "[" + ",".join(f"{v:.4f}" for v in _topv.tolist()) + "]"
+                        + f" | eos[{_eos_str}]",
+                    )
+                except Exception as _e:
+                    _edge_debug_log("logits", f"<logits-debug-error:{_e}>")
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self.need_accepted_tokens:
@@ -6322,11 +6388,29 @@ class NPUModelRunner(GPUModelRunner):
                 self.num_layers - self.tail_k,
                 self.num_layers,
             ))
+            # [EDGE-DEBUG] ① segment_e 的输入（cloud 返回并 recv 到的中间张量）
+            if _edge_debug_enabled("seg_e_in"):
+                _it = intermediate_tensors
+                _hs = _it["hidden_states"] if _it is not None else None
+                _rs = _it["residual"] if _it is not None else None
+                _edge_debug_log(
+                    "seg_e_in",
+                    f"num_tokens_padded={num_tokens_padded} "
+                    + _edge_debug_tensor("in_hidden", _hs) + " | "
+                    + _edge_debug_tensor("in_residual", _rs),
+                )
             hidden_states = seg_e(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
             )
+            # [EDGE-DEBUG] ② segment_e 的输出（tail 层 + norm 后的 hidden_states）
+            if _edge_debug_enabled("seg_e_out"):
+                _out = hidden_states
+                if isinstance(_out, IntermediateTensors):
+                    _out = _out["hidden_states"]
+                _edge_debug_log(
+                    "seg_e_out", _edge_debug_tensor("out_hidden", _out))
             if seg_e_graph and not forward_context.capturing:
                 self._update_full_graph_params_if_needed(
                     forward_context, num_tokens_padded, positions,

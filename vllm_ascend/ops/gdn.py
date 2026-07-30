@@ -435,7 +435,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                          or getattr(_fc, "capturing", False))
             except Exception:
                 _warm = False
-            if not _warm and _GDN_DEBUG_N.get("_co", 0) < 4:
+            if not _warm and num_tokens < 32 and _GDN_DEBUG_N.get("_co", 0) < 6:
                 _GDN_DEBUG_N["_co"] = _GDN_DEBUG_N.get("_co", 0) + 1
                 try:
                     _gdn_logger.info(

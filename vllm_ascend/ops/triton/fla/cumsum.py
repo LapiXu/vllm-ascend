@@ -93,7 +93,8 @@ def chunk_local_cumsum_scalar(
     if cu_seqlens is not None and block_indices is None:
         block_indices = prepare_chunk_indices(cu_seqlens, chunk_size=OPTIM_BLOCK_SIZE)
     num_blocks = len(block_indices) if cu_seqlens is not None else triton.cdiv(T, OPTIM_BLOCK_SIZE)
-    g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
+    # [EDGE-FIX] 同 kkt：用 zeros 而非 empty，避免未写入区域残留未初始化内存。
+    g_org, g = g, torch.zeros_like(g, dtype=output_dtype or g.dtype)
     grid = (num_blocks, B)
     chunk_local_cumsum_scalar_kernel[grid](
         s=g_org,

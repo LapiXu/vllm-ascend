@@ -72,6 +72,21 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices_chunk64,
         output_dtype=torch.float32,
     )
+    # [EDGE-DEBUG] 验证 zeros 修复后 A_kkt 是否仍首次爆炸
+    _n3 = getattr(chunk_gated_delta_rule_fwd, "_edge_n3", 0)
+    try:
+        _cap3 = __import__("vllm.compilation.monitor", fromlist=["x"]).cudagraph_capturing_enabled
+    except Exception:
+        _cap3 = False
+    if not _cap3 and k.shape[1] < 64 and _n3 < 6:
+        chunk_gated_delta_rule_fwd._edge_n3 = _n3 + 1
+        from vllm.logger import logger as _lg3
+        _lg3.warning(
+            "[EDGE-DEBUG][kkt2] T=%s k=%.4f beta=%.4f g=%.4f -> A_kkt[absmax=%.4f nan=%s inf=%s]",
+            k.shape[1], k.float().abs().max().item(), beta.float().abs().max().item(),
+            g.float().abs().max().item(), A.float().abs().max().item(),
+            bool(torch.isnan(A.float()).any().item()),
+            bool(torch.isinf(A.float()).any().item()))
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens,

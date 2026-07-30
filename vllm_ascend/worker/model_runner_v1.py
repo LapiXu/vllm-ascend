@@ -6376,6 +6376,22 @@ class NPUModelRunner(GPUModelRunner):
                 if old_layer_idx is not None:
                     _EXTRA_CTX.layer_idx = old_layer_idx
 
+            # [EDGE-DEBUG] ⑥ edge segment_a 的输出（head 层输出，即将发给 cloud）
+            _is_warmup_a = (
+                getattr(forward_context, "in_profile_run", False)
+                or getattr(forward_context, "capturing", False)
+                or getattr(_monitor, "cudagraph_capturing_enabled", False)
+            )
+            if not _is_warmup_a and _edge_debug_enabled("seg_a_out"):
+                _aout = hidden_states
+                if isinstance(_aout, IntermediateTensors):
+                    _edge_debug_log(
+                        "seg_a_out",
+                        f"num_tokens_padded={num_tokens_padded} "
+                        + _edge_debug_tensor("a_out_hidden", _aout["hidden_states"])
+                        + " | "
+                        + _edge_debug_tensor("a_out_residual", _aout["residual"]),
+                    )
             assert isinstance(hidden_states, IntermediateTensors)
             return hidden_states
 
@@ -6902,11 +6918,41 @@ class NPUModelRunner(GPUModelRunner):
                     if extract_layer_index(name) < global_start
                 )
                 forward_context.moe_layer_index = moe_start
+        # [EDGE-DEBUG] ④ cloud segment_c 的输入（来自 edge segment_a 的 head 输出）
+        _is_warmup_c = (
+            getattr(forward_context, "in_profile_run", False)
+            or getattr(forward_context, "capturing", False)
+            or getattr(_monitor, "cudagraph_capturing_enabled", False)
+        )
+        if not _is_warmup_c and _edge_debug_enabled("seg_c_in"):
+            _cit = intermediate_tensors
+            _chs = _cit["hidden_states"] if _cit is not None else None
+            _crs = _cit["residual"] if _cit is not None else None
+            _edge_debug_log(
+                "seg_c_in",
+                f"num_tokens_padded={num_tokens_padded} "
+                f"slice={None if layer_slice_info is None else (layer_slice_info.start_layer, layer_slice_info.end_layer)} "
+                + _edge_debug_tensor("c_in_hidden", _chs) + " | "
+                + _edge_debug_tensor("c_in_residual", _crs),
+            )
         hidden_states = seg_c(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             **model_kwargs,
         )
+        # [EDGE-DEBUG] ⑤ cloud segment_c 的输出（发回 edge 前）
+        if not _is_warmup_c and _edge_debug_enabled("seg_c_out"):
+            _cout = hidden_states
+            if isinstance(_cout, IntermediateTensors):
+                _edge_debug_log(
+                    "seg_c_out",
+                    _edge_debug_tensor("c_out_hidden", _cout["hidden_states"])
+                    + " | "
+                    + _edge_debug_tensor("c_out_residual", _cout["residual"]),
+                )
+            else:
+                _edge_debug_log(
+                    "seg_c_out", _edge_debug_tensor("c_out", _cout))
         if seg_c_graph and not forward_context.capturing:
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions,

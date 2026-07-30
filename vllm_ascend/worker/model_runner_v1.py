@@ -4740,7 +4740,12 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             # [EDGE-DEBUG] ③ 采样前 logits：看 argmax 是否落在 EOS，以及 EOS 的 logit 值
-            if _edge_debug_enabled("logits"):
+            # 仅在 PREFILL 批次打印（首 token 来自 prefill）：decode 批次
+            # (batch_type=DECODE_*) 跳过，避免每个 decode step 都做 topk(248320)
+            # 引入 host 同步、拖慢/卡住 decode 流水。
+            _bt = getattr(scheduler_output, "batch_type", None)
+            _is_prefill_batch = _bt is None or "PREFILL" in str(_bt).upper()
+            if _is_prefill_batch and _edge_debug_enabled("logits"):
                 try:
                     _l = logits
                     # eos_token_id 在不同 config 层级，逐个兜底查找

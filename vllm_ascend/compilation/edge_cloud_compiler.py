@@ -17,6 +17,7 @@
 import sys
 from typing import Any
 
+import os
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -25,6 +26,12 @@ from vllm.logger import logger
 
 from vllm_ascend.ascend_config import AscendCompilationConfig
 from vllm_ascend.utils import COMPILATION_PASS_KEY
+
+# [EDGE-DEBUG] 实验开关：置 1 时 EdgeCloudCompiledSegment.forward 跳过
+# torch.compile，直接走未编译的原始 segment（eager）。用于验证
+# "segment 编译固化了 GDN 的运行时 metadata 导致首次请求异常" 这个假设。
+_EDGE_DISABLE_SEG_COMPILE = os.environ.get("EDGE_DISABLE_SEG_COMPILE", "0") == "1"
+
 
 
 class EdgeCloudCompiledSegment(nn.Module):
@@ -190,4 +197,7 @@ class EdgeCloudCompiledSegment(nn.Module):
         On first call this triggers Dynamo tracing + backend compilation
         (one-time cost).  Subsequent calls use the compiled callable directly.
         """
+        # [EDGE-DEBUG] 实验：跳过编译，直接走原始 eager segment，验证编译固化假设。
+        if _EDGE_DISABLE_SEG_COMPILE:
+            return self._segment(*args, **kwargs)
         return self._compiled(*args, **kwargs)

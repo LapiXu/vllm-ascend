@@ -82,9 +82,12 @@ def chunk_gated_delta_rule_fwd(
         chunk_gated_delta_rule_fwd._edge_n3 = _n3 + 1
         from vllm.logger import logger as _lg3
         _lg3.warning(
-            "[EDGE-DEBUG][kkt2] T=%s k=%.4f beta=%.4f g=%.4f -> A_kkt[absmax=%.4f nan=%s inf=%s]",
-            k.shape[1], k.float().abs().max().item(), beta.float().abs().max().item(),
-            g.float().abs().max().item(), A.float().abs().max().item(),
+            "[EDGE-DEBUG][kkt2] T=%s shapes k=%s beta=%s g=%s | "
+            "k_sum=%.6f beta_sum=%.6f g_sum=%.6f | "
+            "A_kkt[absmax=%.4f sum=%.6f nan=%s inf=%s]",
+            k.shape[1], tuple(k.shape), tuple(beta.shape), tuple(g.shape),
+            k.float().sum().item(), beta.float().sum().item(), g.float().sum().item(),
+            A.float().abs().max().item(), A.float().sum().item(),
             bool(torch.isnan(A.float()).any().item()),
             bool(torch.isinf(A.float()).any().item()))
     A = solve_tril(

@@ -6359,6 +6359,35 @@ class NPUModelRunner(GPUModelRunner):
             old_layer_idx = _EXTRA_CTX.layer_idx
             if _EXTRA_CTX.layer_idx is not None:
                 _EXTRA_CTX.layer_idx = 0
+            # [EDGE-DEBUG] ⑦ segment_a 的输入（input_ids / positions / inputs_embeds）
+            # 用于区分：首次异常是 (A) 输入本身不同，还是 (B) layer0 GDN 状态问题。
+            _is_warmup_ain = (
+                getattr(forward_context, "in_profile_run", False)
+                or getattr(forward_context, "capturing", False)
+                or getattr(_monitor, "cudagraph_capturing_enabled", False)
+            )
+            if not _is_warmup_ain and _edge_debug_enabled("seg_a_in"):
+                try:
+                    _ii = input_ids
+                    _ii_str = (
+                        f"input_ids[shape={tuple(_ii.shape)}]="
+                        + str(_ii.flatten()[:16].tolist())
+                        if isinstance(_ii, torch.Tensor) else f"input_ids={_ii}"
+                    )
+                    _pp = positions
+                    _pp_str = (
+                        f"positions[shape={tuple(_pp.shape)}]="
+                        + str(_pp.flatten()[:16].tolist())
+                        if isinstance(_pp, torch.Tensor) else f"positions={_pp}"
+                    )
+                    _edge_debug_log(
+                        "seg_a_in",
+                        f"num_tokens_padded={num_tokens_padded} | {_ii_str} | "
+                        f"{_pp_str} | "
+                        + _edge_debug_tensor("inputs_embeds", inputs_embeds),
+                    )
+                except Exception as _e:
+                    _edge_debug_log("seg_a_in", f"<seg_a_in-debug-error:{_e}>")
             try:
                 hidden_states = seg_a(
                     input_ids=input_ids,

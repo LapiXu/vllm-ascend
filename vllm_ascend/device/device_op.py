@@ -1896,7 +1896,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             num_core=num_core,
             num_warps=8,
             num_stages=3,
-            multibuffer=True,
+            multibuffer=False,  # [EDGE-DEBUG] 验证 multibuffer 首次未初始化假设
             disable_tightly_coupled_buffer_reuse=True,
         )
         return A

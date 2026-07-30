@@ -72,6 +72,23 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices_chunk64,
         output_dtype=torch.float32,
     )
+    # [EDGE-DEBUG] 验证"首次执行是 warmup 伪结果、重跑一次即正确"假设：
+    # 进程级仅第一次真实调用时，把 kkt kernel 再跑一次，用第二次结果。
+    if not getattr(chunk_gated_delta_rule_fwd, "_kkt_rerun_done", False):
+        chunk_gated_delta_rule_fwd._kkt_rerun_done = True
+        _A_first_absmax = A.float().abs().max().item()
+        A = chunk_scaled_dot_kkt_fwd(
+            k=k,
+            beta=beta,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices_chunk64,
+            output_dtype=torch.float32,
+        )
+        from vllm.logger import logger as _lgr
+        _lgr.warning(
+            "[EDGE-DEBUG][kkt_rerun] first_absmax=%.4f second_absmax=%.4f",
+            _A_first_absmax, A.float().abs().max().item())
     # [EDGE-DEBUG] 验证 zeros 修复后 A_kkt 是否仍首次爆炸
     _n3 = getattr(chunk_gated_delta_rule_fwd, "_edge_n3", 0)
     try:

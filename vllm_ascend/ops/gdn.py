@@ -35,6 +35,40 @@ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_s
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
+# [EDGE-DEBUG] eager 模式下（EDGE_DISABLE_SEG_COMPILE=1）观测首次 prefill 的
+# conv_state 状态。仅在 EDGE_DEBUG_FIRST=1 时启用，前若干次、且仅 prefill。
+import os as _os
+import logging as _logging
+_GDN_DEBUG = _os.environ.get("EDGE_DEBUG_FIRST", "0") == "1"
+_GDN_DEBUG_MAX = int(_os.environ.get("EDGE_DEBUG_MAX_STEPS", "6"))
+_GDN_DEBUG_N = {"conv": 0}
+_gdn_logger = _logging.getLogger("vllm_ascend.gdn_debug")
+
+
+def _gdn_dbg_conv_prefill(prefix, tag, cache_indices, initial_state_mode,
+                          has_initial_state, conv_state):
+    if not _GDN_DEBUG or _GDN_DEBUG_N["conv"] >= _GDN_DEBUG_MAX:
+        return
+    if tag == "before":
+        _GDN_DEBUG_N["conv"] += 1
+    try:
+        def _t(x):
+            return (str(x.flatten()[:8].tolist())
+                    if isinstance(x, torch.Tensor) else str(x))
+        if isinstance(cache_indices, torch.Tensor) and cache_indices.numel() > 0:
+            sel = conv_state[cache_indices.to(torch.int64)]
+            cs = (f"absmax={sel.float().abs().max().item():.5f} "
+                  f"allzero={bool((sel == 0).all().item())}")
+        else:
+            cs = "<no-indices>"
+        _gdn_logger.info(
+            "[EDGE-DEBUG][gdn_conv_prefill][%s] prefix=%s cache_indices=%s "
+            "initial_state_mode=%s has_initial_state=%s | conv_state[slots] %s",
+            tag, prefix, _t(cache_indices), _t(initial_state_mode),
+            _t(has_initial_state), cs)
+    except Exception as _e:
+        _gdn_logger.info("[EDGE-DEBUG][gdn_conv_prefill][%s] <error:%s>", tag, _e)
+
 
 
 
@@ -564,6 +598,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
 
                     mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
+                    _gdn_dbg_conv_prefill(
+                        getattr(self, "prefix", "?"), "before", cache_indices_opt,
+                        initial_state_mode_opt, has_initial_state, self_kv_cache[0])
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
                         mixed_qkv_non_spec_output,
                         mixed_qkv_non_spec,
@@ -578,6 +615,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         pad_slot_id=PAD_SLOT_ID,
                         run_mode=0,
                     )
+                    _gdn_dbg_conv_prefill(
+                        getattr(self, "prefix", "?"), "after", cache_indices_opt,
+                        initial_state_mode_opt, has_initial_state, self_kv_cache[0])
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
         elif attn_metadata.num_decodes > 0:
             conv_weights_T = conv_weights.transpose(0, 1)

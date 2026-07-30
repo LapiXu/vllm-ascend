@@ -357,6 +357,17 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         3. Output projection
         """
         num_tokens = hidden_states.size(0)
+        # [EDGE-DEBUG] AscendGatedDeltaNetAttention.forward 入口（patch 替换后的 GDN forward，
+        # 由 self.linear_attn(...) 直接调用，不经 custom op）。eager 下必触发。
+        if _GDN_DEBUG and _GDN_DEBUG_N.get("_afwd", 0) < 3 and num_tokens > 1:
+            _GDN_DEBUG_N["_afwd"] = _GDN_DEBUG_N.get("_afwd", 0) + 1
+            try:
+                _gdn_logger.info(
+                    "[EDGE-DEBUG][gdn_afwd] prefix=%s num_tokens=%s hidden_absmax=%.5f",
+                    getattr(self, "prefix", "?"), num_tokens,
+                    hidden_states.float().abs().max().item())
+            except Exception as _e:
+                _gdn_logger.info("[EDGE-DEBUG][gdn_afwd] <error:%s>", _e)
         if hasattr(self, "in_proj_qkv"):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)

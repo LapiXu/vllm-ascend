@@ -126,7 +126,15 @@ def chunk_scaled_dot_kkt_fwd(
     if cu_seqlens is not None and chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
+    # [EDGE-FIX] 首次请求 content 为空的根因修复：
+    # A 形状是 [B, T, H, BT]，BT=chunk_size=64，但 kernel 只写 T(实际 token 数,
+    # 如首 prefill 的 14)范围内的行；chunk 里剩余 (64-T) 行若用 torch.empty 分配
+    # 则是未初始化内存。下游 solve_tril 对整个 64x64 chunk 做三角求逆，读到这些
+    # 垃圾行 -> 病态矩阵 -> A/w/u 爆炸(1e38/inf) -> logits 异常 -> 首 token 采样到
+    # 特殊 token -> content 空。首次读到 OS 垃圾(必炸)，之后读到内存池残留小值(碰巧不炸)。
+    # 改用 torch.zeros 让未写入区域确定为 0，消除未定义行为。与 core_attn_out
+    # (vllm PR #28182) 同类修复。
+    A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
 
     num_core = get_aicore_num()
     bh_step = B * H

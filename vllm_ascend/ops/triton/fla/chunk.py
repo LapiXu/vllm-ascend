@@ -72,27 +72,6 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices_chunk64,
         output_dtype=torch.float32,
     )
-    # [EDGE-DEBUG] 二分定位 w/u 爆炸来源：kkt / solve_tril / recompute 三段
-    _dbg_on = False
-    _T2 = k.shape[1]
-    try:
-        _cap2 = __import__("vllm.compilation.monitor", fromlist=["x"]).cudagraph_capturing_enabled
-    except Exception:
-        _cap2 = False
-    _n2 = getattr(chunk_gated_delta_rule_fwd, "_edge_n2", 0)
-    if not _cap2 and _T2 < 64 and _n2 < 6:
-        _dbg_on = True
-        chunk_gated_delta_rule_fwd._edge_n2 = _n2 + 1
-        from vllm.logger import logger as _lg2
-        try:
-            _lg2.warning(
-                "[EDGE-DEBUG][gdn_stage][kkt] T=%s k[absmax=%.4f] beta[absmax=%.4f] "
-                "g[absmax=%.4f nan=%s] -> A_kkt[absmax=%.4f nan=%s]",
-                _T2, k.float().abs().max().item(), beta.float().abs().max().item(),
-                g.float().abs().max().item(), bool(torch.isnan(g.float()).any().item()),
-                A.float().abs().max().item(), bool(torch.isnan(A.float()).any().item()))
-        except Exception as _e:
-            _lg2.warning("[EDGE-DEBUG][gdn_stage][kkt] <error:%s>", _e)
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens,
@@ -100,14 +79,6 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices_bt=chunk_indices_chunk64,
         output_dtype=k.dtype,
     )
-    if _dbg_on:
-        from vllm.logger import logger as _lg2
-        try:
-            _lg2.warning(
-                "[EDGE-DEBUG][gdn_stage][solve_tril] A_solved[absmax=%.4f nan=%s]",
-                A.float().abs().max().item(), bool(torch.isnan(A.float()).any().item()))
-        except Exception as _e:
-            _lg2.warning("[EDGE-DEBUG][gdn_stage][solve_tril] <error:%s>", _e)
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
@@ -117,15 +88,6 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices_chunk64,
     )
-    if _dbg_on:
-        from vllm.logger import logger as _lg2
-        try:
-            _lg2.warning(
-                "[EDGE-DEBUG][gdn_stage][recompute] w[absmax=%.4f nan=%s] u[absmax=%.4f nan=%s]",
-                w.float().abs().max().item(), bool(torch.isnan(w.float()).any().item()),
-                u.float().abs().max().item(), bool(torch.isnan(u.float()).any().item()))
-        except Exception as _e:
-            _lg2.warning("[EDGE-DEBUG][gdn_stage][recompute] <error:%s>", _e)
 
     k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
     w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
@@ -170,30 +132,6 @@ def chunk_gated_delta_rule_fwd(
         use_exp2=False,
         transpose_state_layout=False,
     )
-    # [EDGE-DEBUG] 二分定位：AscendC chunk_gated_delta_rule_fwd_h 的输出是否首次爆炸。
-    _T_dbg = k.shape[1]  # [B, T, H, K], head_first=False
-    _n = getattr(chunk_gated_delta_rule_fwd, "_edge_n", 0)
-    try:
-        _cap = __import__("vllm.compilation.monitor", fromlist=["x"]).cudagraph_capturing_enabled
-    except Exception:
-        _cap = False
-    if not _cap and _T_dbg < 64 and _n < 6:
-        chunk_gated_delta_rule_fwd._edge_n = _n + 1
-        from vllm.logger import logger as _lg
-        try:
-            _lg.warning(
-                "[EDGE-DEBUG][gdn_ascendc_h] T=%s w[absmax=%.4f] u[absmax=%.4f] "
-                "init[absmax=%.4f] -> h[absmax=%.4f nan=%s] v_new[absmax=%.4f nan=%s] "
-                "final[absmax=%.4f nan=%s]",
-                _T_dbg,
-                w_ascendc.float().abs().max().item(),
-                u_ascendc.float().abs().max().item(),
-                initial_state_kern.float().abs().max().item() if initial_state_kern is not None else -1,
-                h.float().abs().max().item(), bool(torch.isnan(h.float()).any().item()),
-                v_new.float().abs().max().item(), bool(torch.isnan(v_new.float()).any().item()),
-                final_state.float().abs().max().item(), bool(torch.isnan(final_state.float()).any().item()))
-        except Exception as _e:
-            _lg.warning("[EDGE-DEBUG][gdn_ascendc_h] <error:%s>", _e)
     if keep_meta is not None:
         # Scatter the compacted final_state back to the original [N, H, K, V]
         # layout the PCP state recursion expects; empty segments keep their

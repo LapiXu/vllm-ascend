@@ -44,7 +44,7 @@ import os as _os
 import logging as _logging
 _GDN_DEBUG = _os.environ.get("EDGE_DEBUG_FIRST", "0") == "1"
 _GDN_DEBUG_MAX = int(_os.environ.get("EDGE_DEBUG_MAX_STEPS", "4"))
-_GDN_DEBUG_N = {"conv": 0}
+_GDN_DEBUG_N = {"conv": 0, "core": 0}
 _gdn_logger = _logging.getLogger("vllm_ascend.gdn_debug")
 
 
@@ -479,6 +479,33 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         self_kv_cache = self.kv_cache
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        # [EDGE-DEBUG] _forward_core 入口：确认真实请求走到这里，以及走哪条 conv 分支
+        if _GDN_DEBUG and _GDN_DEBUG_N["core"] < _GDN_DEBUG_MAX and num_actual_tokens > 1:
+            _GDN_DEBUG_N["core"] += 1
+            try:
+                _his = has_initial_state
+                _his_str = (
+                    str(_his.flatten()[:8].tolist())
+                    if isinstance(_his, torch.Tensor) else str(_his)
+                )
+                _nsi = non_spec_state_indices_tensor
+                _nsi_str = (
+                    str(_nsi.flatten()[:8].tolist())
+                    if isinstance(_nsi, torch.Tensor) else str(_nsi)
+                )
+                _gdn_logger.info(
+                    "[EDGE-DEBUG][gdn_core] prefix=%s num_actual=%s "
+                    "num_prefills=%s num_decodes=%s spec_masks=%s "
+                    "has_initial_state=%s non_spec_state_indices=%s",
+                    getattr(self, "prefix", "?"), num_actual_tokens,
+                    getattr(attn_metadata, "num_prefills", "?"),
+                    getattr(attn_metadata, "num_decodes", "?"),
+                    (attn_metadata.spec_sequence_masks is not None),
+                    _his_str, _nsi_str,
+                )
+            except Exception as _e:
+                _gdn_logger.info("[EDGE-DEBUG][gdn_core] <error:%s>", _e)
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]

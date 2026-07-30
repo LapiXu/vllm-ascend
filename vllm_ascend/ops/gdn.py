@@ -797,7 +797,49 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
 
             initial_state = ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
+            # [EDGE-DEBUG] recurrent prefill 的 ssm 初始状态：确认首次是否脏 / 清零是否生效
+            _dbg_this = False
+            if _GDN_DEBUG:
+                try:
+                    import vllm.compilation.monitor as _mon2
+                    _cap2 = getattr(_mon2, "cudagraph_capturing_enabled", False)
+                except Exception:
+                    _cap2 = False
+                _dbg_this = (not _cap2 and _GDN_DEBUG_N.get("_ssm", 0) < 6)
+            if _dbg_this:
+                try:
+                    _gdn_logger.info(
+                        "[EDGE-DEBUG][gdn_ssm][pre_clear] prefix=%s state_indices=%s "
+                        "prefill_has_initial_state=%s | initial_state[absmax=%.5f allzero=%s nan=%s] "
+                        "| ssm_state_global[absmax=%.5f]",
+                        getattr(self, "prefix", "?"),
+                        str(prefill_state_indices.flatten()[:8].tolist()),
+                        str(prefill_has_initial_state.flatten()[:8].tolist()),
+                        initial_state.float().abs().max().item(),
+                        bool((initial_state == 0).all().item()),
+                        bool(torch.isnan(initial_state.float()).any().item()),
+                        ssm_state.float().abs().max().item())
+                except Exception as _e:
+                    _gdn_logger.info("[EDGE-DEBUG][gdn_ssm][pre_clear] <error:%s>", _e)
             clear_ssm_states(initial_state, prefill_has_initial_state)
+            if _dbg_this:
+                try:
+                    _gdn_logger.info(
+                        "[EDGE-DEBUG][gdn_ssm][post_clear] initial_state[absmax=%.5f allzero=%s] "
+                        "| q[absmax=%.5f nan=%s] k[absmax=%.5f] v[absmax=%.5f] "
+                        "g[absmax=%.5f nan=%s] beta[absmax=%.5f]",
+                        initial_state.float().abs().max().item(),
+                        bool((initial_state == 0).all().item()),
+                        query_non_spec.float().abs().max().item(),
+                        bool(torch.isnan(query_non_spec.float()).any().item()),
+                        key_non_spec.float().abs().max().item(),
+                        value_non_spec.float().abs().max().item(),
+                        g_non_spec.float().abs().max().item(),
+                        bool(torch.isnan(g_non_spec.float()).any().item()),
+                        beta_non_spec.float().abs().max().item())
+                except Exception as _e:
+                    _gdn_logger.info("[EDGE-DEBUG][gdn_ssm][post_clear] <error:%s>", _e)
+                _GDN_DEBUG_N["_ssm"] = _GDN_DEBUG_N.get("_ssm", 0) + 1
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,

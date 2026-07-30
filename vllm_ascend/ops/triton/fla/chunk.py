@@ -72,6 +72,27 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices_chunk64,
         output_dtype=torch.float32,
     )
+    # [EDGE-DEBUG] 二分定位 w/u 爆炸来源：kkt / solve_tril / recompute 三段
+    _dbg_on = False
+    _T2 = k.shape[1]
+    try:
+        _cap2 = __import__("vllm.compilation.monitor", fromlist=["x"]).cudagraph_capturing_enabled
+    except Exception:
+        _cap2 = False
+    _n2 = getattr(chunk_gated_delta_rule_fwd, "_edge_n2", 0)
+    if not _cap2 and _T2 < 64 and _n2 < 6:
+        _dbg_on = True
+        chunk_gated_delta_rule_fwd._edge_n2 = _n2 + 1
+        from vllm.logger import logger as _lg2
+        try:
+            _lg2.warning(
+                "[EDGE-DEBUG][gdn_stage][kkt] T=%s k[absmax=%.4f] beta[absmax=%.4f] "
+                "g[absmax=%.4f nan=%s] -> A_kkt[absmax=%.4f nan=%s]",
+                _T2, k.float().abs().max().item(), beta.float().abs().max().item(),
+                g.float().abs().max().item(), bool(torch.isnan(g.float()).any().item()),
+                A.float().abs().max().item(), bool(torch.isnan(A.float()).any().item()))
+        except Exception as _e:
+            _lg2.warning("[EDGE-DEBUG][gdn_stage][kkt] <error:%s>", _e)
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens,
@@ -79,6 +100,14 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices_bt=chunk_indices_chunk64,
         output_dtype=k.dtype,
     )
+    if _dbg_on:
+        from vllm.logger import logger as _lg2
+        try:
+            _lg2.warning(
+                "[EDGE-DEBUG][gdn_stage][solve_tril] A_solved[absmax=%.4f nan=%s]",
+                A.float().abs().max().item(), bool(torch.isnan(A.float()).any().item()))
+        except Exception as _e:
+            _lg2.warning("[EDGE-DEBUG][gdn_stage][solve_tril] <error:%s>", _e)
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
@@ -88,6 +117,15 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices_chunk64,
     )
+    if _dbg_on:
+        from vllm.logger import logger as _lg2
+        try:
+            _lg2.warning(
+                "[EDGE-DEBUG][gdn_stage][recompute] w[absmax=%.4f nan=%s] u[absmax=%.4f nan=%s]",
+                w.float().abs().max().item(), bool(torch.isnan(w.float()).any().item()),
+                u.float().abs().max().item(), bool(torch.isnan(u.float()).any().item()))
+        except Exception as _e:
+            _lg2.warning("[EDGE-DEBUG][gdn_stage][recompute] <error:%s>", _e)
 
     k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
     w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()

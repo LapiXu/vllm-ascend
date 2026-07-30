@@ -840,6 +840,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 except Exception as _e:
                     _gdn_logger.info("[EDGE-DEBUG][gdn_ssm][post_clear] <error:%s>", _e)
                 _GDN_DEBUG_N["_ssm"] = _GDN_DEBUG_N.get("_ssm", 0) + 1
+            # [EDGE-DEBUG] 验证 race 假设：recurrent kernel 前强制流同步。
+            # 若首次恢复正常，则坐实"首次 recurrent 读到未完成的上游输出"。
+            if _os.environ.get("EDGE_SYNC_BEFORE_RECURRENT", "0") == "1":
+                torch.npu.synchronize()
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,

@@ -132,6 +132,32 @@ def chunk_gated_delta_rule_fwd(
         use_exp2=False,
         transpose_state_layout=False,
     )
+    # [EDGE-DEBUG] 二分定位：AscendC chunk_gated_delta_rule_fwd_h 的输出是否首次爆炸。
+    import os as _os_dbg
+    if _os_dbg.environ.get("EDGE_DEBUG_FIRST", "0") == "1":
+        _T_dbg = k.shape[1]  # [B, T, H, K], head_first=False
+        _n = getattr(chunk_gated_delta_rule_fwd, "_edge_n", 0)
+        try:
+            _cap = __import__("vllm.compilation.monitor", fromlist=["x"]).cudagraph_capturing_enabled
+        except Exception:
+            _cap = False
+        if not _cap and _T_dbg < 64 and _n < 6:
+            chunk_gated_delta_rule_fwd._edge_n = _n + 1
+            from vllm.logger import logger as _lg
+            try:
+                _lg.warning(
+                    "[EDGE-DEBUG][gdn_ascendc_h] T=%s w[absmax=%.4f] u[absmax=%.4f] "
+                    "init[absmax=%.4f] -> h[absmax=%.4f nan=%s] v_new[absmax=%.4f nan=%s] "
+                    "final[absmax=%.4f nan=%s]",
+                    _T_dbg,
+                    w_ascendc.float().abs().max().item(),
+                    u_ascendc.float().abs().max().item(),
+                    initial_state_kern.float().abs().max().item() if initial_state_kern is not None else -1,
+                    h.float().abs().max().item(), bool(torch.isnan(h.float()).any().item()),
+                    v_new.float().abs().max().item(), bool(torch.isnan(v_new.float()).any().item()),
+                    final_state.float().abs().max().item(), bool(torch.isnan(final_state.float()).any().item()))
+            except Exception as _e:
+                _lg.warning("[EDGE-DEBUG][gdn_ascendc_h] <error:%s>", _e)
     if keep_meta is not None:
         # Scatter the compacted final_state back to the original [N, H, K, V]
         # layout the PCP state recursion expects; empty segments keep their

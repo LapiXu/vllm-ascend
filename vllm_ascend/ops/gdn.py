@@ -890,14 +890,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 except Exception as _e:
                     _gdn_logger.info("[EDGE-DEBUG][gdn_ssm][post_clear] <error:%s>", _e)
                 _GDN_DEBUG_N["_ssm"] = _GDN_DEBUG_N.get("_ssm", 0) + 1
-            # [EDGE-DEBUG] 修复候选：recurrent kernel 前强制 contiguous，
-            # 模拟 gdn_ssm 探针曾让首次数值从 4.8e28→10 的效果。
-            query_non_spec = query_non_spec.contiguous()
-            key_non_spec = key_non_spec.contiguous()
-            value_non_spec = value_non_spec.contiguous()
-            g_non_spec = g_non_spec.contiguous()
-            beta_non_spec = beta_non_spec.contiguous()
-            initial_state = initial_state.contiguous()
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,

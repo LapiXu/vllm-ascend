@@ -340,6 +340,56 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
+        """预热 GDN prefill 的 Triton autotune kernel（chunk_gated_delta_rule）。
+
+        [EDGE-DEBUG] 根因修复候选：ascend 覆盖此方法为空，且 _forward_core 在
+        attn_metadata is None（profile/warmup）时直接 return，导致
+        chunk_gated_delta_rule 的 Triton autotune 从未在 warmup 触发，而是
+        推迟到【首次真实请求】——首次 autotune 试跑期间数值不稳定（NaN/巨值），
+        造成首次回复异常，第二次起因 autotune 缓存命中而正常。
+
+        这里用小 dummy 张量跑一次 prefill 路径的 chunk_gated_delta_rule，
+        在 warmup 阶段把 autotune 缓存填好。用 env EDGE_WARMUP_GDN=1 开启，
+        便于与关闭态对比验证。
+        """
+        if _os.environ.get("EDGE_WARMUP_GDN", "0") != "1":
+            return
+        if getattr(self, "_edge_gdn_warmed", False):
+            return
+        self._edge_gdn_warmed = True
+        try:
+            device = qkv_or_qkvz.device
+            dtype = qkv_or_qkvz.dtype
+            num_v_heads = self.num_v_heads // self.tp_size
+            T = 64  # = chunk_size，足以覆盖所有 BT=chunk_size 的 autotune 缓存
+            q = torch.randn(1, T, self.num_k_heads // self.tp_size, self.head_k_dim,
+                            device=device, dtype=dtype)
+            k = torch.randn(1, T, self.num_k_heads // self.tp_size, self.head_k_dim,
+                            device=device, dtype=dtype)
+            v = torch.randn(1, T, num_v_heads, self.head_v_dim,
+                            device=device, dtype=dtype)
+            g = torch.randn(1, T, num_v_heads, device=device, dtype=torch.float32)
+            beta = torch.rand(1, T, num_v_heads, device=device, dtype=dtype)
+            initial_state = torch.zeros(
+                1, num_v_heads, self.head_k_dim, self.head_v_dim,
+                device=device, dtype=torch.float32)
+            cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
+            chunk_gated_delta_rule(
+                q=q, k=k, v=v, g=g, beta=beta,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                prebuilt_meta=None,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            _gdn_logger.info(
+                "[EDGE-DEBUG][gdn_warmup] prefill autotune warmed for layer %s (T=%d)",
+                getattr(self, "prefix", "?"), T)
+        except Exception as _e:
+            _gdn_logger.warning(
+                "[EDGE-DEBUG][gdn_warmup] failed for layer %s: %s",
+                getattr(self, "prefix", "?"), _e)
         return
 
     def _warmup_prefill_kernels_v0202(self, mixed_qkv: torch.Tensor) -> None:
@@ -481,7 +531,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # V1 profile run
+            # V1 profile run：借此时机预热 GDN prefill 的 Triton autotune，
+            # 避免推迟到首次真实请求导致数值不稳定。
+            try:
+                self._warmup_prefill_kernels(mixed_qkv, 0)
+            except Exception:
+                pass
             return
 
         assert isinstance(attn_metadata, dict)

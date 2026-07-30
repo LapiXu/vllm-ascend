@@ -467,6 +467,26 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
 
+        # [EDGE-DEBUG] _forward_core 入口（eager 下一定能打）
+        if _GDN_DEBUG and _GDN_DEBUG_N.get("_fc", 0) < 2:
+            _GDN_DEBUG_N["_fc"] = _GDN_DEBUG_N.get("_fc", 0) + 1
+            try:
+                _gdn_logger.info(
+                    "[EDGE-DEBUG][gdn_fc_enter] prefix=%s num_actual=%s "
+                    "num_prefills=%s num_decodes=%s spec_masks=%s "
+                    "has_initial_state=%s non_spec_state_indices=%s",
+                    getattr(self, "prefix", "?"), num_actual_tokens,
+                    getattr(attn_metadata, "num_prefills", "?"),
+                    getattr(attn_metadata, "num_decodes", "?"),
+                    (attn_metadata.spec_sequence_masks is not None),
+                    str(has_initial_state.flatten()[:8].tolist())[:60]
+                    if isinstance(has_initial_state, torch.Tensor) else str(has_initial_state),
+                    str(non_spec_state_indices_tensor.flatten()[:8].tolist())[:60]
+                    if isinstance(non_spec_state_indices_tensor, torch.Tensor) else str(non_spec_state_indices_tensor),
+                )
+            except Exception as _e:
+                _gdn_logger.info("[EDGE-DEBUG][gdn_fc_enter] <error:%s>", _e)
+
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]

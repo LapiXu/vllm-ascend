@@ -426,16 +426,22 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             False,
         )
         # [EDGE-DEBUG] custom op 之后：GDN core 输出是否首次≈0（residual≈embedding 的根因）
-        # 用 in_profile_run/capturing 跳过 warmup，把观测留给真实请求。
+        # 用 in_profile_run/capturing + cudagraph 捕获标志跳过 warmup，把观测留给真实请求。
         if _GDN_DEBUG:
+            try:
+                import vllm.compilation.monitor as _mon
+                _capturing = getattr(_mon, "cudagraph_capturing_enabled", False)
+            except Exception:
+                _capturing = False
             try:
                 from vllm.forward_context import get_forward_context as _gfc
                 _fc = _gfc()
                 _warm = (getattr(_fc, "in_profile_run", False)
-                         or getattr(_fc, "capturing", False))
+                         or getattr(_fc, "capturing", False)
+                         or _capturing)
             except Exception:
-                _warm = False
-            if not _warm and num_tokens < 32 and _GDN_DEBUG_N.get("_co", 0) < 6:
+                _warm = _capturing
+            if not _warm and _GDN_DEBUG_N.get("_co", 0) < 6:
                 _GDN_DEBUG_N["_co"] = _GDN_DEBUG_N.get("_co", 0) + 1
                 try:
                     _gdn_logger.info(

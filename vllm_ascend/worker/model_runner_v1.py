@@ -4740,11 +4740,11 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             # [EDGE-DEBUG] ③ 采样前 logits：看 argmax 是否落在 EOS，以及 EOS 的 logit 值
-            # 仅在 PREFILL 批次打印（首 token 来自 prefill）：decode 批次
-            # (batch_type=DECODE_*) 跳过，避免每个 decode step 都做 topk(248320)
-            # 引入 host 同步、拖慢/卡住 decode 流水。
+            # 仅在明确的 PREFILL 批次打印（首 token 来自 prefill）：batch_type
+            # 未知/None 或不含 PREFILL 一律跳过，避免 decode 每步做 topk(248320)
+            # 引入 host 同步、卡住 aclgraph replay。
             _bt = getattr(scheduler_output, "batch_type", None)
-            _is_prefill_batch = _bt is None or "PREFILL" in str(_bt).upper()
+            _is_prefill_batch = _bt is not None and "PREFILL" in str(_bt).upper()
             if _is_prefill_batch and _edge_debug_enabled("logits"):
                 try:
                     _l = logits
@@ -6371,7 +6371,7 @@ class NPUModelRunner(GPUModelRunner):
                 or getattr(forward_context, "capturing", False)
                 or getattr(_monitor, "cudagraph_capturing_enabled", False)
             )
-            if not _is_warmup_ain and _edge_debug_enabled("seg_a_in"):
+            if not _is_warmup_ain and num_tokens_padded > 1 and _edge_debug_enabled("seg_a_in"):
                 try:
                     _ii = input_ids
                     _ii_str = (
@@ -6416,7 +6416,7 @@ class NPUModelRunner(GPUModelRunner):
                 or getattr(forward_context, "capturing", False)
                 or getattr(_monitor, "cudagraph_capturing_enabled", False)
             )
-            if not _is_warmup_a and _edge_debug_enabled("seg_a_out"):
+            if not _is_warmup_a and num_tokens_padded > 1 and _edge_debug_enabled("seg_a_out"):
                 _aout = hidden_states
                 if isinstance(_aout, IntermediateTensors):
                     _edge_debug_log(
@@ -6454,7 +6454,7 @@ class NPUModelRunner(GPUModelRunner):
                 or getattr(forward_context, "capturing", False)
                 or getattr(_monitor, "cudagraph_capturing_enabled", False)
             )
-            if not _is_warmup and _edge_debug_enabled("seg_e_in"):
+            if not _is_warmup and num_tokens_padded > 1 and _edge_debug_enabled("seg_e_in"):
                 _it = intermediate_tensors
                 _hs = _it["hidden_states"] if _it is not None else None
                 _rs = _it["residual"] if _it is not None else None
@@ -6470,7 +6470,7 @@ class NPUModelRunner(GPUModelRunner):
                 **model_kwargs,
             )
             # [EDGE-DEBUG] ② segment_e 的输出（tail 层 + norm 后的 hidden_states）
-            if not _is_warmup and _edge_debug_enabled("seg_e_out"):
+            if not _is_warmup and num_tokens_padded > 1 and _edge_debug_enabled("seg_e_out"):
                 _out = hidden_states
                 if isinstance(_out, IntermediateTensors):
                     _out = _out["hidden_states"]
@@ -6958,7 +6958,7 @@ class NPUModelRunner(GPUModelRunner):
             or getattr(forward_context, "capturing", False)
             or getattr(_monitor, "cudagraph_capturing_enabled", False)
         )
-        if not _is_warmup_c and _edge_debug_enabled("seg_c_in"):
+        if not _is_warmup_c and num_tokens_padded > 1 and _edge_debug_enabled("seg_c_in"):
             _cit = intermediate_tensors
             _chs = _cit["hidden_states"] if _cit is not None else None
             _crs = _cit["residual"] if _cit is not None else None
@@ -6975,7 +6975,7 @@ class NPUModelRunner(GPUModelRunner):
             **model_kwargs,
         )
         # [EDGE-DEBUG] ⑤ cloud segment_c 的输出（发回 edge 前）
-        if not _is_warmup_c and _edge_debug_enabled("seg_c_out"):
+        if not _is_warmup_c and num_tokens_padded > 1 and _edge_debug_enabled("seg_c_out"):
             _cout = hidden_states
             if isinstance(_cout, IntermediateTensors):
                 _edge_debug_log(

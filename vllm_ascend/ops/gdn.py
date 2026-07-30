@@ -35,6 +35,56 @@ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_s
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
+# ============================ [EDGE-DEBUG] ============================
+# GDN conv_state 诊断：仅在 EDGE_DEBUG_FIRST=1 时启用。用于定位
+# "首一尾一首次请求 content 为空"——确认首次 prefill 时 layer0 GDN 的
+# conv_state slot 在 kernel 调用前是否非零（是否被 warmup/capture 写脏），
+# 以及 initial_state_mode / state_indices 的实际取值。仅打印前 N 次（默认 4）。
+import os as _os
+import logging as _logging
+_GDN_DEBUG = _os.environ.get("EDGE_DEBUG_FIRST", "0") == "1"
+_GDN_DEBUG_MAX = int(_os.environ.get("EDGE_DEBUG_MAX_STEPS", "4"))
+_GDN_DEBUG_N = {"conv": 0}
+_gdn_logger = _logging.getLogger("vllm_ascend.gdn_debug")
+
+
+def _gdn_debug_conv(prefix, cache_indices, initial_state_mode, conv_state):
+    """打印 conv_state prefill 调用前的诊断信息（前后各调一次）。"""
+    if not _GDN_DEBUG:
+        return
+    if _GDN_DEBUG_N["conv"] >= _GDN_DEBUG_MAX:
+        return
+    _GDN_DEBUG_N["conv"] += 1
+    try:
+        ci = cache_indices
+        ci_str = (
+            str(ci.flatten()[:8].tolist()) if isinstance(ci, torch.Tensor)
+            else str(ci)
+        )
+        ism = initial_state_mode
+        ism_str = (
+            str(ism.flatten()[:8].tolist()) if isinstance(ism, torch.Tensor)
+            else str(ism)
+        )
+        # 只看被本次 prefill 用到的 slot 的 conv_state 统计量
+        if isinstance(ci, torch.Tensor) and ci.numel() > 0:
+            sel = conv_state[ci.to(torch.int64)]
+            cs = (
+                f"conv_state[used_slots] absmax={sel.float().abs().max().item():.5f} "
+                f"sum={sel.float().abs().sum().item():.5f} "
+                f"allzero={bool((sel == 0).all().item())}"
+            )
+        else:
+            cs = "conv_state[used_slots]=<no-indices>"
+        _gdn_logger.info(
+            "[EDGE-DEBUG][gdn_conv][%s] cache_indices=%s initial_state_mode=%s | %s",
+            prefix, ci_str, ism_str, cs,
+        )
+    except Exception as _e:
+        _gdn_logger.info("[EDGE-DEBUG][gdn_conv][%s] <error:%s>", prefix, _e)
+# ========================== [/EDGE-DEBUG] ============================
+
+
 def to_int64_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
     tensor = tensor.to(torch.int64)
     if tensor.dim() == 0:
@@ -561,6 +611,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
 
                     mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
+                    # [EDGE-DEBUG] conv_state 调用前：确认首次 slot 是否被写脏
+                    _gdn_debug_conv(
+                        "before", cache_indices_opt,
+                        initial_state_mode_opt, self_kv_cache[0])
                     torch.ops._C_ascend.npu_causal_conv1d_custom(
                         mixed_qkv_non_spec_output,
                         mixed_qkv_non_spec,
@@ -575,6 +629,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         pad_slot_id=PAD_SLOT_ID,
                         run_mode=0,
                     )
+                    # [EDGE-DEBUG] conv_state 调用后：确认本次 prefill 写回了尾部
+                    _gdn_debug_conv(
+                        "after", cache_indices_opt,
+                        initial_state_mode_opt, self_kv_cache[0])
                     mixed_qkv_non_spec = mixed_qkv_non_spec_output
         elif attn_metadata.num_decodes > 0:
             conv_weights_T = conv_weights.transpose(0, 1)

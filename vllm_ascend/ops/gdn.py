@@ -425,6 +425,28 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.prefix,
             False,
         )
+        # [EDGE-DEBUG] custom op 之后：GDN core 输出是否首次≈0（residual≈embedding 的根因）
+        # 用 in_profile_run/capturing 跳过 warmup，把观测留给真实请求。
+        if _GDN_DEBUG:
+            try:
+                from vllm.forward_context import get_forward_context as _gfc
+                _fc = _gfc()
+                _warm = (getattr(_fc, "in_profile_run", False)
+                         or getattr(_fc, "capturing", False))
+            except Exception:
+                _warm = False
+            if not _warm and _GDN_DEBUG_N.get("_co", 0) < 4:
+                _GDN_DEBUG_N["_co"] = _GDN_DEBUG_N.get("_co", 0) + 1
+                try:
+                    _gdn_logger.info(
+                        "[EDGE-DEBUG][gdn_core_out] prefix=%s num_tokens=%s "
+                        "mixed_qkv[absmax=%.5f] core_attn_out[absmax=%.5f allzero=%s]",
+                        getattr(self, "prefix", "?"), num_tokens,
+                        mixed_qkv.float().abs().max().item(),
+                        core_attn_out.float().abs().max().item(),
+                        bool((core_attn_out == 0).all().item()))
+                except Exception as _e:
+                    _gdn_logger.info("[EDGE-DEBUG][gdn_core_out] <error:%s>", _e)
 
         # ============================================================
         # Part 3: Output Projection

@@ -42,7 +42,10 @@ import logging as _logging
 _GDN_DEBUG = _os.environ.get("EDGE_DEBUG_FIRST", "0") == "1"
 _GDN_DEBUG_MAX = int(_os.environ.get("EDGE_DEBUG_MAX_STEPS", "6"))
 _GDN_DEBUG_N = {"conv": 0}
-_gdn_logger = _logging.getLogger("vllm_ascend.gdn_debug")
+# 用 vllm 的 logger（INFO 级生效）；自建 getLogger 默认继承 root 的 WARNING 级，
+# 会把 .info() 静默丢弃——这正是之前所有 gdn 探针不打印的原因。
+from vllm.logger import logger as _gdn_logger
+_gdn_logger.setLevel(_logging.INFO)
 
 
 def _gdn_dbg_conv_prefill(prefix, tag, cache_indices, initial_state_mode,

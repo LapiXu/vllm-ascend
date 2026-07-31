@@ -890,6 +890,32 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 except Exception as _e:
                     _gdn_logger.info("[EDGE-DEBUG][gdn_ssm][post_clear] <error:%s>", _e)
                 _GDN_DEBUG_N["_ssm"] = _GDN_DEBUG_N.get("_ssm", 0) + 1
+            # [EDGE-FIX] 根因修复：GDN prefill 的 Triton kernel 链
+            # (chunk_scaled_dot_kkt / solve_tril / recompute_w_u / chunk_o 等)
+            # 在【进程内首次执行】时产生伪结果(相同输入却输出错误的病态值,
+            # 导致 A/w/u 爆炸 -> 首 token 采样异常 -> 首次请求 content 空/截断)。
+            # 重跑一次即恢复正常(已确诊:first_absmax=460 -> second=0.77)。
+            # 因此在进程级首次 prefill 时，把整条 recurrent 链空跑一次丢弃，
+            # 把所有子 kernel 的"首次伪结果"消耗掉；之后所有真实请求都正确。
+            # 该 warmup 每进程只做一次，开销可忽略。
+            if not getattr(AscendGatedDeltaNetAttention, "_edge_gdn_prefill_warmed", False):
+                AscendGatedDeltaNetAttention._edge_gdn_prefill_warmed = True
+                try:
+                    chunk_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        cu_seqlens=prefill_query_start_loc,
+                        prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
+                        head_first=False,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                except Exception:
+                    pass
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,

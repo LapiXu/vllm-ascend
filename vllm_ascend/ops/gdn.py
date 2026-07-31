@@ -340,42 +340,43 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
-        """预热 GDN prefill 的 Triton autotune kernel（chunk_gated_delta_rule）。
+        """预热 GDN prefill kernel（chunk_gated_delta_rule）。
 
-        [EDGE-DEBUG] 根因修复候选：ascend 覆盖此方法为空，且 _forward_core 在
-        attn_metadata is None（profile/warmup）时直接 return，导致
-        chunk_gated_delta_rule 的 Triton autotune 从未在 warmup 触发，而是
-        推迟到【首次真实请求】——首次 autotune 试跑期间数值不稳定（NaN/巨值），
-        造成首次回复异常，第二次起因 autotune 缓存命中而正常。
-
-        这里用小 dummy 张量跑一次 prefill 路径的 chunk_gated_delta_rule，
-        在 warmup 阶段把 autotune 缓存填好。用 env EDGE_WARMUP_GDN=1 开启，
-        便于与关闭态对比验证。
+        [EDGE-FIX] 之前的空函数 + 之前的 EDGE_WARMUP_GDN 环境变量门都去掉。
+        vllm 原版在 _forward_core 的 None 分支调这个，ascend 覆写丢失了它，
+        导致首次 prefill 是 kkt 真正首次执行（首次 sum=12432 vs 二次=131）。
+        现在用真实 qkv_or_qkvz（profile run 已有），按 vllm 原设计消耗首次伪结果。
         """
-        if _os.environ.get("EDGE_WARMUP_GDN", "0") != "1":
-            return
         if getattr(self, "_edge_gdn_warmed", False):
             return
         self._edge_gdn_warmed = True
         try:
-            device = qkv_or_qkvz.device
-            dtype = qkv_or_qkvz.dtype
+            T = qkv_or_qkvz.shape[0]  # 真实 qkvz 的 token 数
             num_v_heads = self.num_v_heads // self.tp_size
-            T = 64  # = chunk_size，足以覆盖所有 BT=chunk_size 的 autotune 缓存
-            q = torch.randn(1, T, self.num_k_heads // self.tp_size, self.head_k_dim,
-                            device=device, dtype=dtype)
-            k = torch.randn(1, T, self.num_k_heads // self.tp_size, self.head_k_dim,
-                            device=device, dtype=dtype)
-            v = torch.randn(1, T, num_v_heads, self.head_v_dim,
-                            device=device, dtype=dtype)
-            g = torch.randn(1, T, num_v_heads, device=device, dtype=torch.float32)
-            beta = torch.rand(1, T, num_v_heads, device=device, dtype=dtype)
+            head_v_dim = self.head_v_dim
+            head_k_dim = self.head_k_dim
+            num_k_heads = self.num_k_heads // self.tp_size
+            dtype = qkv_or_qkvz.dtype
+            device = qkv_or_qkvz.device
+            # 按 forward 实际调用方式构造输入
+            # qkv_or_qkvz = [q, k, v, z] 拼成的 (1, T, qkvz_dim)
+            qkv_dim = (2 * self.key_dim + self.value_dim) // self.tp_size
+            z_dim = self.value_dim // self.tp_size
+            qkv_or_qkvz_2d = qkv_or_qkvz.view(T, qkv_dim + z_dim)
+            mixed_qkv, z = qkv_or_qkvz_2d.split([qkv_dim, z_dim], dim=-1)
+            z = z.reshape(z.size(0), -1, head_v_dim)
+            ba = torch.empty(T, num_v_heads * 2, device=device, dtype=dtype)
+            # 用 0 初始化 ba，调用 fused_gdn_gating
+            from vllm_ascend.device.device_op import DeviceOperator
+            b, a = ba.split(num_v_heads, dim=-1)
+            g = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+            beta = b.contiguous()
             initial_state = torch.zeros(
-                1, num_v_heads, self.head_k_dim, self.head_v_dim,
+                1, num_v_heads, head_k_dim, head_v_dim,
                 device=device, dtype=torch.float32)
             cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
             chunk_gated_delta_rule(
-                q=q, k=k, v=v, g=g, beta=beta,
+                q=mixed_qkv, k=mixed_qkv, v=mixed_qkv, g=g, beta=beta,
                 initial_state=initial_state,
                 output_final_state=True,
                 cu_seqlens=cu_seqlens,
@@ -383,14 +384,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
-            _gdn_logger.info(
-                "[EDGE-DEBUG][gdn_warmup] prefill autotune warmed for layer %s (T=%d)",
-                getattr(self, "prefix", "?"), T)
         except Exception as _e:
-            _gdn_logger.warning(
-                "[EDGE-DEBUG][gdn_warmup] failed for layer %s: %s",
-                getattr(self, "prefix", "?"), _e)
-        return
+            from vllm.logger import logger as _lgW
+            _lgW.warning("[EDGE-FIX][gdn_warmup] failed: %s", _e)
 
     def _warmup_prefill_kernels_v0202(self, mixed_qkv: torch.Tensor) -> None:
         return
@@ -531,7 +527,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # V1 profile run
+            # V1 profile run：调用 vllm 标准的 _warmup_prefill_kernels，
+            # 用真实 qkvz 预热 chunk_gated_delta_rule 的 Triton kernel
+            # （消耗首次执行的伪结果 / multibuffer workspace 初始化）。
+            # 之前 ascend 覆写此方法为空函数且这里直接 return，丢失了
+            # vllm 原版的预热机制，导致首次 prefill 是 kkt 真正首次执行。
+            # 修复：调一次 self._warmup_prefill_kernels(qkv_or_qkvz, 0)。
+            self._warmup_prefill_kernels(qkv_or_qkvz, 0)
             return
 
         assert isinstance(attn_metadata, dict)

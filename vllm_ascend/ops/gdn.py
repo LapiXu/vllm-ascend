@@ -692,7 +692,33 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
 
             initial_state = ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
+            # [EDGE-DEBUG] 打印 8: 进入本次请求时 ssm_state / initial_state 的统计
+            import logging as _diag_log2
+            _diag2 = _diag_log2.getLogger("vllm_ascend.diag")
+
+            def _gdn_stats(t, prefix):
+                if t is None:
+                    return f"{prefix}=None"
+                tf = t.detach().float()
+                return (
+                    f"{prefix}_sum={tf.sum().item():.6f} "
+                    f"{prefix}_absmax={tf.abs().max().item():.6f} "
+                    f"finite={bool(torch.isfinite(tf).all().item())}"
+                )
+
+            _diag2.warning(
+                "[EDGE-DEBUG][gdn_in_initial_state] prefill_state_indices=%s "
+                "prefill_has_initial_state=%s %s %s",
+                prefill_state_indices.tolist() if hasattr(prefill_state_indices, "tolist") else prefill_state_indices,
+                prefill_has_initial_state.tolist() if hasattr(prefill_has_initial_state, "tolist") else prefill_has_initial_state,
+                _gdn_stats(ssm_state, "ssm_state_full"),
+                _gdn_stats(initial_state, "initial_state_pre_clear"),
+            )
             clear_ssm_states(initial_state, prefill_has_initial_state)
+            _diag2.warning(
+                "[EDGE-DEBUG][gdn_in_initial_state_post_clear] %s",
+                _gdn_stats(initial_state, "initial_state_post_clear"),
+            )
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,

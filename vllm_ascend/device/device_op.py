@@ -974,6 +974,12 @@ class BaseDeviceAdaptor:
     def chunk_scaled_dot_kkt_fwd(
         num_core, bh_step, task_num, k, beta, g_cumsum, A, cu_seqlens, chunk_indices, T, B, H, Hg, K, BT, BK
     ):
+        # [EDGE-DEBUG] multibuffer removed (diag) — diagnostic print before launch
+        import logging as _diag_log
+        _diag_log.getLogger("vllm_ascend.diag").warning(
+            "[EDGE-DEBUG][kkt_launch] multibuffer=False T=%d B=%d H=%d Hg=%d K=%d BT=%d BK=%d num_core=%d task_num=%d",
+            T, B, H, Hg, K, BT, BK, num_core, task_num,
+        )
         chunk_scaled_dot_kkt_fwd_kernel[(num_core,)](
             k=k,
             beta=beta,
@@ -993,7 +999,7 @@ class BaseDeviceAdaptor:
             num_core=num_core,
             num_warps=8,
             num_stages=3,
-            multibuffer=True,
+            # multibuffer=True,  # [EDGE-DEBUG] disabled for first-launch stability investigation
         )
 
         return A
@@ -1877,6 +1883,12 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
     def chunk_scaled_dot_kkt_fwd(
         num_core, bh_step, task_num, k, beta, g_cumsum, A, cu_seqlens, chunk_indices, T, B, H, Hg, K, BT, BK
     ):
+        # [EDGE-DEBUG] multibuffer removed (diag) — diagnostic print before launch
+        import logging as _diag_log
+        _diag_log.getLogger("vllm_ascend.diag").warning(
+            "[EDGE-DEBUG][kkt_launch_a5] multibuffer=False T=%d B=%d H=%d Hg=%d K=%d BT=%d BK=%d num_core=%d task_num=%d",
+            T, B, H, Hg, K, BT, BK, num_core, task_num,
+        )
         chunk_scaled_dot_kkt_fwd_kernel[(num_core,)](
             k=k,
             beta=beta,
@@ -1896,7 +1908,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             num_core=num_core,
             num_warps=8,
             num_stages=3,
-            multibuffer=True,
+            # multibuffer=True,                          # [EDGE-DEBUG] disabled for first-launch stability investigation
             disable_tightly_coupled_buffer_reuse=True,
         )
         return A

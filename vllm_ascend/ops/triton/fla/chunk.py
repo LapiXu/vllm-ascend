@@ -64,6 +64,25 @@ def chunk_gated_delta_rule_fwd(
         block_indices=block_indices_cumsum,
     )
     # obtain WY representation. u is actually the new v.
+    # [EDGE-DEBUG] 最小验证：先搞清楚 cudagraph_capturing_enabled 在
+    # capture/profile/真实请求各阶段到底返回什么，再决定怎么用它做守卫。
+    # 不执行任何修复，只打印环境状态。
+    try:
+        import vllm.compilation.monitor as _monK
+        _capK = getattr(_monK, "cudagraph_capturing_enabled", None)
+    except Exception as _ee:
+        _capK = f"import_error:{_ee}"
+    from vllm.logger import logger as _lgK
+    _K = getattr(chunk_gated_delta_rule_fwd, "_Kobs", 0)
+    if _K < 10:
+        chunk_gated_delta_rule_fwd._Kobs = _K + 1
+        try:
+            _lgK.warning(
+                "[EDGE-DEBUG][capture_obs] T=%s kkt_in_sum=%.6f "
+                "cudagraph_capturing_enabled=%r",
+                k.shape[1], k.float().sum().item(), _capK)
+        except Exception as _ee:
+            _lgK.warning("[EDGE-DEBUG][capture_obs] <error:%s>", _ee)
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
         beta=beta,

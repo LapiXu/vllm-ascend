@@ -946,7 +946,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             if not getattr(AscendGatedDeltaNetAttention, "_edge_gdn_decode_warmed", False):
                 AscendGatedDeltaNetAttention._edge_gdn_decode_warmed = True
                 try:
-                    torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+                    _w_out = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
                         query=query_non_spec.squeeze(0),
                         key=key_non_spec.squeeze(0),
                         value=value_non_spec.squeeze(0),
@@ -957,8 +957,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         actual_seq_lengths=actual_seq_lengths,
                         ssm_state_indices=non_spec_state_indices_tensor,
                     )
-                except Exception:
-                    pass
+                except Exception as _ee:
+                    from vllm.logger import logger as _lgr2
+                    _lgr2.warning("[EDGE-DEBUG][decode_warmup] FAILED: %s", _ee)
+                else:
+                    from vllm.logger import logger as _lgr2
+                    _lgr2.warning("[EDGE-DEBUG][decode_warmup] OK fired once")
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(

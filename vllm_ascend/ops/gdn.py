@@ -939,6 +939,26 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_non_spec = l2norm_fwd(query_non_spec)
             key_non_spec = l2norm_fwd(key_non_spec)
+            # [EDGE-FIX] 同 prefill：AscendC npu_recurrent_gated_delta_rule
+            # (decode recurrent) 首次执行也是伪结果。进程级首次 decode 时
+            # 用真实输入空跑一次丢弃，消耗首次伪结果。ssm_state 的写入
+            # 会被紧随其后的真实调用用相同输入覆盖，安全。
+            if not getattr(AscendGatedDeltaNetAttention, "_edge_gdn_decode_warmed", False):
+                AscendGatedDeltaNetAttention._edge_gdn_decode_warmed = True
+                try:
+                    torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+                        query=query_non_spec.squeeze(0),
+                        key=key_non_spec.squeeze(0),
+                        value=value_non_spec.squeeze(0),
+                        g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
+                        beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
+                        state=ssm_state,
+                        scale=key_non_spec.shape[-1] ** -0.5,
+                        actual_seq_lengths=actual_seq_lengths,
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                    )
+                except Exception:
+                    pass
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(

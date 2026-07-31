@@ -899,27 +899,26 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # 把所有子 kernel 的"首次伪结果"消耗掉；之后所有真实请求都正确。
             # 该 warmup 每进程只做一次，开销可忽略。
             if not getattr(AscendGatedDeltaNetAttention, "_edge_gdn_prefill_warmed", False):
-                # 同 decode：必须在真实请求时触发，不能被 capture/profile 抢先消耗。
-                import vllm.compilation.monitor as _mon_p
-                _cap_p = getattr(_mon_p, "cudagraph_capturing_enabled", False)
-                if not _cap_p:
-                    AscendGatedDeltaNetAttention._edge_gdn_prefill_warmed = True
-                    try:
-                        chunk_gated_delta_rule(
-                            q=query_non_spec,
-                            k=key_non_spec,
-                            v=value_non_spec,
-                            g=g_non_spec,
-                            beta=beta_non_spec,
-                            initial_state=initial_state,
-                            output_final_state=True,
-                            cu_seqlens=prefill_query_start_loc,
-                            prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
-                            head_first=False,
-                            use_qk_l2norm_in_kernel=True,
-                        )
-                    except Exception:
-                        pass
+                # "先到先得"：capture/profile 阶段或真实请求最先到达的这一次执行消耗
+                # 首次伪结果。profile 的 prefill 写 ssm_state 的 dummy slot，真实请求
+                # prefill 会用新分配的 ssm_state slot 并通过 warmup 后的 kernel 写入。
+                AscendGatedDeltaNetAttention._edge_gdn_prefill_warmed = True
+                try:
+                    chunk_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        cu_seqlens=prefill_query_start_loc,
+                        prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
+                        head_first=False,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                except Exception:
+                    pass
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,
@@ -948,30 +947,31 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             # 用真实输入空跑一次丢弃，消耗首次伪结果。ssm_state 的写入
             # 会被紧随其后的真实调用用相同输入覆盖，安全。
             if not getattr(AscendGatedDeltaNetAttention, "_edge_gdn_decode_warmed", False):
-                # 必须在真实请求时触发，不能被 graph capture 阶段抢先消耗。
-                # graph capture 阶段虽然也走这段代码，但 cudagraph_capturing_enabled 为 True。
-                import vllm.compilation.monitor as _mon_d
-                _cap_d = getattr(_mon_d, "cudagraph_capturing_enabled", False)
-                if not _cap_d:
-                    AscendGatedDeltaNetAttention._edge_gdn_decode_warmed = True
-                    try:
-                        _w_out = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
-                            query=query_non_spec.squeeze(0),
-                            key=key_non_spec.squeeze(0),
-                            value=value_non_spec.squeeze(0),
-                            g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
-                            beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
-                            state=ssm_state,
-                            scale=key_non_spec.shape[-1] ** -0.5,
-                            actual_seq_lengths=actual_seq_lengths,
-                            ssm_state_indices=non_spec_state_indices_tensor,
-                        )
-                    except Exception as _ee:
-                        from vllm.logger import logger as _lgr2
-                        _lgr2.warning("[EDGE-DEBUG][decode_warmup] FAILED: %s", _ee)
-                    else:
-                        from vllm.logger import logger as _lgr2
-                        _lgr2.warning("[EDGE-DEBUG][decode_warmup] OK fired once")
+                # "先到先得"策略：让 capture 阶段或真实请求中最先到达的这一次执行
+                # 消耗首次伪结果。capture 的 dummy 数据写到 ssm_state 的 dummy slot
+                # 会被后续真实请求 prefill 覆盖，无副作用。真实请求 decode 槽位
+                # 在 prefill 阶段会先写新 ssm_state，所以即使 capture 先消耗
+                # 了 warmup，真实请求第一次 decode 用的 ssm_state 也是 prefill 刚写的
+                # 正确值(首次伪结果已在前面的 warmup/真实 prefill 中被消耗)。
+                AscendGatedDeltaNetAttention._edge_gdn_decode_warmed = True
+                try:
+                    _w_out = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+                        query=query_non_spec.squeeze(0),
+                        key=key_non_spec.squeeze(0),
+                        value=value_non_spec.squeeze(0),
+                        g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
+                        beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
+                        state=ssm_state,
+                        scale=key_non_spec.shape[-1] ** -0.5,
+                        actual_seq_lengths=actual_seq_lengths,
+                        ssm_state_indices=non_spec_state_indices_tensor,
+                    )
+                except Exception as _ee:
+                    from vllm.logger import logger as _lgr2
+                    _lgr2.warning("[EDGE-DEBUG][decode_warmup] FAILED: %s", _ee)
+                else:
+                    from vllm.logger import logger as _lgr2
+                    _lgr2.warning("[EDGE-DEBUG][decode_warmup] OK fired once")
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(

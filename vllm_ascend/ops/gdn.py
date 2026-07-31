@@ -419,6 +419,24 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 f"finite={bool(torch.isfinite(tf).all().item())}"
             )
 
+        def _is_capturing():
+            """Detect whether the current NPU stream is inside a cudagraph
+            capture.  Diagnostic .item() / .tolist() calls are unsafe here."""
+            try:
+                import torch_npu
+                return bool(torch_npu.npu.is_current_stream_capturing())
+            except Exception:
+                try:
+                    from vllm.compilation.monitor import (
+                        validate_cudagraph_capturing_enabled,
+                    )
+                    validate_cudagraph_capturing_enabled()
+                    return True
+                except Exception:
+                    return False
+
+        _diag_active = not _is_capturing()
+
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -675,15 +693,16 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_decode = l2norm_fwd(query_decode)
             key_decode = l2norm_fwd(key_decode)
             # [EDGE-DEBUG] 打印 10: decode 算子调用前 - ssm_state 状态
-            _decode_indices = non_spec_state_indices_tensor[: attn_metadata.num_decodes]
-            _diag2.warning(
-                "[EDGE-DEBUG][gdn_before_decode_split] num_decodes=%d indices=%s %s q=%s k=%s",
-                attn_metadata.num_decodes,
-                _decode_indices.tolist() if hasattr(_decode_indices, "tolist") else _decode_indices,
-                _gdn_stats(ssm_state[_decode_indices] if _decode_indices.numel() else ssm_state, "ssm_state_at_decode"),
-                _gdn_stats(query_decode, "query_decode"),
-                _gdn_stats(key_decode, "key_decode"),
-            )
+            if _diag_active:
+                _decode_indices = non_spec_state_indices_tensor[: attn_metadata.num_decodes]
+                _diag2.warning(
+                    "[EDGE-DEBUG][gdn_before_decode_split] num_decodes=%d indices=%s %s q=%s k=%s",
+                    attn_metadata.num_decodes,
+                    _decode_indices.tolist() if hasattr(_decode_indices, "tolist") else _decode_indices,
+                    _gdn_stats(ssm_state[_decode_indices] if _decode_indices.numel() else ssm_state, "ssm_state_at_decode"),
+                    _gdn_stats(query_decode, "query_decode"),
+                    _gdn_stats(key_decode, "key_decode"),
+                )
             core_attn_out_decode = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
                 query=query_decode.squeeze(0),
                 key=key_decode.squeeze(0),
@@ -696,10 +715,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_indices=non_spec_state_indices_tensor[: attn_metadata.num_decodes],
             ).unsqueeze(0)
             # [EDGE-DEBUG] 打印 11: decode 算子输出
-            _diag2.warning(
-                "[EDGE-DEBUG][gdn_after_decode_split] %s",
-                _gdn_stats(core_attn_out_decode, "core_attn_out_decode"),
-            )
+            if _diag_active:
+                _diag2.warning(
+                    "[EDGE-DEBUG][gdn_after_decode_split] %s",
+                    _gdn_stats(core_attn_out_decode, "core_attn_out_decode"),
+                )
         else:
             core_attn_out_decode = None
 
@@ -722,19 +742,21 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
             initial_state = ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
             # [EDGE-DEBUG] 打印 8: 进入本次请求时 ssm_state / initial_state 的统计
-            _diag2.warning(
-                "[EDGE-DEBUG][gdn_in_initial_state] prefill_state_indices=%s "
-                "prefill_has_initial_state=%s %s %s",
-                prefill_state_indices.tolist() if hasattr(prefill_state_indices, "tolist") else prefill_state_indices,
-                prefill_has_initial_state.tolist() if hasattr(prefill_has_initial_state, "tolist") else prefill_has_initial_state,
-                _gdn_stats(ssm_state, "ssm_state_full"),
-                _gdn_stats(initial_state, "initial_state_pre_clear"),
-            )
+            if _diag_active:
+                _diag2.warning(
+                    "[EDGE-DEBUG][gdn_in_initial_state] prefill_state_indices=%s "
+                    "prefill_has_initial_state=%s %s %s",
+                    prefill_state_indices.tolist() if hasattr(prefill_state_indices, "tolist") else prefill_state_indices,
+                    prefill_has_initial_state.tolist() if hasattr(prefill_has_initial_state, "tolist") else prefill_has_initial_state,
+                    _gdn_stats(ssm_state, "ssm_state_full"),
+                    _gdn_stats(initial_state, "initial_state_pre_clear"),
+                )
             clear_ssm_states(initial_state, prefill_has_initial_state)
-            _diag2.warning(
-                "[EDGE-DEBUG][gdn_in_initial_state_post_clear] %s",
-                _gdn_stats(initial_state, "initial_state_post_clear"),
-            )
+            if _diag_active:
+                _diag2.warning(
+                    "[EDGE-DEBUG][gdn_in_initial_state_post_clear] %s",
+                    _gdn_stats(initial_state, "initial_state_post_clear"),
+                )
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,
@@ -750,11 +772,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
             # [EDGE-DEBUG] 打印 9: prefill 写回 ssm_state 后, 该 block 状态
-            _diag2.warning(
-                "[EDGE-DEBUG][gdn_after_prefill_write] prefill_state_indices=%s %s",
-                prefill_state_indices.tolist() if hasattr(prefill_state_indices, "tolist") else prefill_state_indices,
-                _gdn_stats(ssm_state[prefill_state_indices], "ssm_state_after_prefill_write"),
-            )
+            if _diag_active:
+                _diag2.warning(
+                    "[EDGE-DEBUG][gdn_after_prefill_write] prefill_state_indices=%s %s",
+                    prefill_state_indices.tolist() if hasattr(prefill_state_indices, "tolist") else prefill_state_indices,
+                    _gdn_stats(ssm_state[prefill_state_indices], "ssm_state_after_prefill_write"),
+                )
             if split_non_spec:
                 core_attn_out_non_spec = torch.cat(
                     [core_attn_out_decode, core_attn_out_non_spec],
@@ -765,12 +788,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_non_spec = l2norm_fwd(query_non_spec)
             key_non_spec = l2norm_fwd(key_non_spec)
             # [EDGE-DEBUG] 打印 12: decode 算子 (prefill-only path) 前
-            _diag2.warning(
-                "[EDGE-DEBUG][gdn_before_decode_nonspec] num_decodes=%d indices=%s %s",
-                attn_metadata.num_decodes,
-                non_spec_state_indices_tensor.tolist() if hasattr(non_spec_state_indices_tensor, "tolist") else non_spec_state_indices_tensor,
-                _gdn_stats(ssm_state[non_spec_state_indices_tensor] if non_spec_state_indices_tensor.numel() else ssm_state, "ssm_state_at_decode_nonspec"),
-            )
+            if _diag_active:
+                _diag2.warning(
+                    "[EDGE-DEBUG][gdn_before_decode_nonspec] num_decodes=%d indices=%s %s",
+                    attn_metadata.num_decodes,
+                    non_spec_state_indices_tensor.tolist() if hasattr(non_spec_state_indices_tensor, "tolist") else non_spec_state_indices_tensor,
+                    _gdn_stats(ssm_state[non_spec_state_indices_tensor] if non_spec_state_indices_tensor.numel() else ssm_state, "ssm_state_at_decode_nonspec"),
+                )
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
@@ -785,10 +809,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_indices=non_spec_state_indices_tensor,
             ).unsqueeze(0)
             # [EDGE-DEBUG] 打印 13: decode 算子 (prefill-only path) 输出
-            _diag2.warning(
-                "[EDGE-DEBUG][gdn_after_decode_nonspec] %s",
-                _gdn_stats(core_attn_out_non_spec, "core_attn_out_nonspec"),
-            )
+            if _diag_active:
+                _diag2.warning(
+                    "[EDGE-DEBUG][gdn_after_decode_nonspec] %s",
+                    _gdn_stats(core_attn_out_non_spec, "core_attn_out_nonspec"),
+                )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 

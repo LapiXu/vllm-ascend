@@ -188,6 +188,30 @@ def chunk_gated_delta_rule_fwd(
         _n, _diag_stats(w, "w"), _diag_stats(u, "u"),
     )
 
+    # [EDGE-DEBUG] 方案 D: w/u NaN 探测 + 重试
+    # 现象: n=1 首次 prefill + PREFILL_1 stream + TP0 切分时, recompute_w_u_fwd
+    #       输出 NaN; 重跑一次命中稳态路径后正常.
+    _w_ok = bool(torch.isfinite(w).all().item())
+    _u_ok = bool(torch.isfinite(u).all().item())
+    if not (_w_ok and _u_ok):
+        _diag.warning(
+            "[EDGE-DEBUG][wu_nan_retry] n=%d w_finite=%s u_finite=%s 重跑 recompute_w_u_fwd",
+            _n, _w_ok, _u_ok,
+        )
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices_chunk64,
+        )
+        _diag.warning(
+            "[EDGE-DEBUG][wu_after_retry] n=%d %s %s",
+            _n, _diag_stats(w, "w_retry"), _diag_stats(u, "u_retry"),
+        )
+
     k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
     w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
     u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()

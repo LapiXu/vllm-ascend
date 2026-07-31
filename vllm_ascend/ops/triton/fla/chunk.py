@@ -72,6 +72,25 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices_chunk64,
         output_dtype=torch.float32,
     )
+    # [EDGE-DEBUG] 逐个 kernel 验证"首次 vs 二次"差异(sum 指纹),
+    # 仅在真实 prefill (T 较小、cudagraph 不在 capture) 触发,前若干次。
+    from vllm.logger import logger as _lgP
+    try:
+        import vllm.compilation.monitor as _monP
+        _capP = getattr(_monP, "cudagraph_capturing_enabled", False)
+    except Exception:
+        _capP = False
+    if not _capP and k.shape[1] < 64:
+        _P = getattr(chunk_gated_delta_rule_fwd, "_P", 0)
+        if _P < 8:
+            chunk_gated_delta_rule_fwd._P = _P + 1
+            try:
+                _lgP.warning(
+                    "[EDGE-DEBUG][per-kernel] T=%s "
+                    "kkt_out_sum=%.6f kkt_out_absmax=%.4f",
+                    k.shape[1], A.float().sum().item(), A.float().abs().max().item())
+            except Exception as _ee:
+                _lgP.warning("[EDGE-DEBUG][per-kernel][kkt] <error:%s>", _ee)
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens,
@@ -79,6 +98,15 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices_bt=chunk_indices_chunk64,
         output_dtype=k.dtype,
     )
+    if not _capP and k.shape[1] < 64:
+        _P = getattr(chunk_gated_delta_rule_fwd, "_P", 0)
+        if _P < 8:
+            try:
+                _lgP.warning(
+                    "[EDGE-DEBUG][per-kernel] solve_tril_out_sum=%.6f solve_tril_out_absmax=%.4f",
+                    A.float().sum().item(), A.float().abs().max().item())
+            except Exception as _ee:
+                _lgP.warning("[EDGE-DEBUG][per-kernel][solve_tril] <error:%s>", _ee)
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
@@ -88,6 +116,17 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices_chunk64,
     )
+    if not _capP and k.shape[1] < 64:
+        _P = getattr(chunk_gated_delta_rule_fwd, "_P", 0)
+        if _P < 8:
+            try:
+                _lgP.warning(
+                    "[EDGE-DEBUG][per-kernel] w_sum=%.6f w_absmax=%.4f "
+                    "u_sum=%.6f u_absmax=%.4f",
+                    w.float().sum().item(), w.float().abs().max().item(),
+                    u.float().sum().item(), u.float().abs().max().item())
+            except Exception as _ee:
+                _lgP.warning("[EDGE-DEBUG][per-kernel][recompute] <error:%s>", _ee)
 
     k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
     w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
@@ -216,6 +255,24 @@ def chunk_gated_delta_rule_fwd(
     o = o_ascendc.to(torch.bfloat16).transpose(1, 2).contiguous()
     v_new = v_new.to(torch.bfloat16).transpose(1, 2).contiguous()
     h = h.to(torch.bfloat16).transpose(1, 2).contiguous()
+    # [EDGE-DEBUG] chunk_fwd_o (AscendC) 输出探测
+    try:
+        import vllm.compilation.monitor as _monO
+        _capO = getattr(_monO, "cudagraph_capturing_enabled", False)
+    except Exception:
+        _capO = False
+    if not _capO and o.shape[1] < 64:
+        _O = getattr(chunk_gated_delta_rule_fwd, "_O", 0)
+        if _O < 8:
+            chunk_gated_delta_rule_fwd._O = _O + 1
+            from vllm.logger import logger as _lgO
+            try:
+                _lgO.warning(
+                    "[EDGE-DEBUG][per-kernel] chunk_fwd_o_out_sum=%.6f "
+                    "chunk_fwd_o_out_absmax=%.4f",
+                    o.float().sum().item(), o.float().abs().max().item())
+            except Exception as _ee:
+                _lgO.warning("[EDGE-DEBUG][per-kernel][chunk_fwd_o] <error:%s>", _ee)
 
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None

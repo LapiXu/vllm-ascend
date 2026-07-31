@@ -890,37 +890,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 except Exception as _e:
                     _gdn_logger.info("[EDGE-DEBUG][gdn_ssm][post_clear] <error:%s>", _e)
                 _GDN_DEBUG_N["_ssm"] = _GDN_DEBUG_N.get("_ssm", 0) + 1
-            # [EDGE-FIX] 根因修复：GDN prefill 的 Triton kernel 链
-            # (chunk_scaled_dot_kkt / solve_tril / recompute_w_u / chunk_o 等)
-            # 在【进程内首次执行】时产生伪结果(相同输入却输出错误的病态值,
-            # 导致 A/w/u 爆炸 -> 首 token 采样异常 -> 首次请求 content 空/截断)。
-            # 重跑一次即恢复正常(已确诊:first_absmax=460 -> second=0.77)。
-            # 因此在进程级首次 prefill 时，把整条 recurrent 链空跑一次丢弃，
-            # 把所有子 kernel 的"首次伪结果"消耗掉；之后所有真实请求都正确。
-            # 该 warmup 每进程只做一次，开销可忽略。
-            if not getattr(AscendGatedDeltaNetAttention, "_edge_gdn_prefill_warmed", False):
-                # "先到先得"：capture/profile 阶段或真实请求最先到达的这一次执行消耗
-                # 首次伪结果。profile 的 prefill 写 ssm_state 的 dummy slot，真实请求
-                # prefill 会用新分配的 ssm_state slot 并通过 warmup 后的 kernel 写入。
-                AscendGatedDeltaNetAttention._edge_gdn_prefill_warmed = True
-                try:
-                    # kkt 验证：同一输入 first=460, second=0.77。所以跑两次覆盖首次伪结果
-                    for _ in range(2):
-                        chunk_gated_delta_rule(
-                        q=query_non_spec,
-                        k=key_non_spec,
-                        v=value_non_spec,
-                        g=g_non_spec,
-                        beta=beta_non_spec,
-                        initial_state=initial_state,
-                        output_final_state=True,
-                        cu_seqlens=prefill_query_start_loc,
-                        prebuilt_meta=attn_metadata.non_spec_prefill_metadata.chunk,
-                        head_first=False,
-                        use_qk_l2norm_in_kernel=True,
-                    )
-                except Exception:
-                    pass
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,
@@ -944,38 +913,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_non_spec = l2norm_fwd(query_non_spec)
             key_non_spec = l2norm_fwd(key_non_spec)
-            # [EDGE-FIX] 同 prefill：AscendC npu_recurrent_gated_delta_rule
-            # (decode recurrent) 首次执行也是伪结果。进程级首次 decode 时
-            # 用真实输入空跑一次丢弃，消耗首次伪结果。ssm_state 的写入
-            # 会被紧随其后的真实调用用相同输入覆盖，安全。
-            if not getattr(AscendGatedDeltaNetAttention, "_edge_gdn_decode_warmed", False):
-                # "先到先得"策略：让 capture 阶段或真实请求中最先到达的这一次执行
-                # 消耗首次伪结果。capture 的 dummy 数据写到 ssm_state 的 dummy slot
-                # 会被后续真实请求 prefill 覆盖，无副作用。真实请求 decode 槽位
-                # 在 prefill 阶段会先写新 ssm_state，所以即使 capture 先消耗
-                # 了 warmup，真实请求第一次 decode 用的 ssm_state 也是 prefill 刚写的
-                # 正确值(首次伪结果已在前面的 warmup/真实 prefill 中被消耗)。
-                AscendGatedDeltaNetAttention._edge_gdn_decode_warmed = True
-                try:
-                    # 跑两次覆盖可能的"首次伪结果"残余(类比 kkt 第一次/第二次差异)
-                    for _ in range(2):
-                        _w_out = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
-                            query=query_non_spec.squeeze(0),
-                            key=key_non_spec.squeeze(0),
-                            value=value_non_spec.squeeze(0),
-                            g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
-                            beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
-                            state=ssm_state,
-                            scale=key_non_spec.shape[-1] ** -0.5,
-                            actual_seq_lengths=actual_seq_lengths,
-                            ssm_state_indices=non_spec_state_indices_tensor,
-                        )
-                except Exception as _ee:
-                    from vllm.logger import logger as _lgr2
-                    _lgr2.warning("[EDGE-DEBUG][decode_warmup] FAILED: %s", _ee)
-                else:
-                    from vllm.logger import logger as _lgr2
-                    _lgr2.warning("[EDGE-DEBUG][decode_warmup] OK fired once")
+            # [EDGE-FIX] decode warmup 暂移除，先用探针定位首次伪结果
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
@@ -989,6 +927,25 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=non_spec_state_indices_tensor,
             ).unsqueeze(0)
+            # [EDGE-DEBUG] decode AscendC 输出探测（sum 指纹，看首次 vs 二次）
+            try:
+                import vllm.compilation.monitor as _monD
+                _capD = getattr(_monD, "cudagraph_capturing_enabled", False)
+            except Exception:
+                _capD = False
+            if not _capD and core_attn_out_non_spec.shape[1] < 64:
+                _D = getattr(AscendGatedDeltaNetAttention, "_Dprobe", 0)
+                if _D < 8:
+                    AscendGatedDeltaNetAttention._Dprobe = _D + 1
+                    from vllm.logger import logger as _lgD
+                    try:
+                        _lgD.warning(
+                            "[EDGE-DEBUG][per-kernel] decode_ascendc_out_sum=%.6f "
+                            "decode_ascendc_out_absmax=%.4f",
+                            core_attn_out_non_spec.float().sum().item(),
+                            core_attn_out_non_spec.float().abs().max().item())
+                    except Exception as _ee:
+                        _lgD.warning("[EDGE-DEBUG][per-kernel][decode_ascendc] <error:%s>", _ee)
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 

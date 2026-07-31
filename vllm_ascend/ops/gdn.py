@@ -904,7 +904,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # prefill 会用新分配的 ssm_state slot 并通过 warmup 后的 kernel 写入。
                 AscendGatedDeltaNetAttention._edge_gdn_prefill_warmed = True
                 try:
-                    chunk_gated_delta_rule(
+                    # kkt 验证：同一输入 first=460, second=0.77。所以跑两次覆盖首次伪结果
+                    for _ in range(2):
+                        chunk_gated_delta_rule(
                         q=query_non_spec,
                         k=key_non_spec,
                         v=value_non_spec,
@@ -955,17 +957,19 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # 正确值(首次伪结果已在前面的 warmup/真实 prefill 中被消耗)。
                 AscendGatedDeltaNetAttention._edge_gdn_decode_warmed = True
                 try:
-                    _w_out = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
-                        query=query_non_spec.squeeze(0),
-                        key=key_non_spec.squeeze(0),
-                        value=value_non_spec.squeeze(0),
-                        g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
-                        beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
-                        state=ssm_state,
-                        scale=key_non_spec.shape[-1] ** -0.5,
-                        actual_seq_lengths=actual_seq_lengths,
-                        ssm_state_indices=non_spec_state_indices_tensor,
-                    )
+                    # 跑两次覆盖可能的"首次伪结果"残余(类比 kkt 第一次/第二次差异)
+                    for _ in range(2):
+                        _w_out = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+                            query=query_non_spec.squeeze(0),
+                            key=key_non_spec.squeeze(0),
+                            value=value_non_spec.squeeze(0),
+                            g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
+                            beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
+                            state=ssm_state,
+                            scale=key_non_spec.shape[-1] ** -0.5,
+                            actual_seq_lengths=actual_seq_lengths,
+                            ssm_state_indices=non_spec_state_indices_tensor,
+                        )
                 except Exception as _ee:
                     from vllm.logger import logger as _lgr2
                     _lgr2.warning("[EDGE-DEBUG][decode_warmup] FAILED: %s", _ee)

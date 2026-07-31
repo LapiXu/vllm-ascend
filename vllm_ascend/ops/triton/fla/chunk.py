@@ -28,6 +28,41 @@ from .solve_tril import solve_tril
 from .utils import input_guard, prepare_final_chunk_indices
 from .wy_fast import recompute_w_u_fwd
 
+# [EDGE-DEBUG] diagnostic logging for first-launch KKT investigation
+import logging as _diag_log
+_diag_log.getLogger("vllm_ascend.diag").setLevel(_diag_log.WARNING)
+_diag = _diag_log.getLogger("vllm_ascend.diag")
+_DIAG_COUNTER = {"n": 0}
+
+
+def _diag_stats(t: torch.Tensor, prefix: str) -> str:
+    """Compact tensor stats (sync). Use sparingly on hot path."""
+    if t is None:
+        return f"{prefix}=None"
+    if not torch.is_tensor(t) or t.numel() == 0:
+        return f"{prefix}=empty"
+    tf = t.detach().float()
+    s = tf.sum().item()
+    a = tf.abs().max().item()
+    finite = bool(torch.isfinite(tf).all().item())
+    return f"{prefix}_sum={s:.6f} {prefix}_absmax={a:.6f} finite={finite}"
+
+
+def _diag_capture_state() -> bool:
+    """Best-effort detect whether we are inside a cudagraph capture."""
+    try:
+        from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+
+        # We can't easily get the monitor here, so use the global state via the
+        # standard guard: it raises if NOT capturing.  We invert to a bool.
+        try:
+            validate_cudagraph_capturing_enabled()
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
 
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
@@ -57,12 +92,56 @@ def chunk_gated_delta_rule_fwd(
     update_chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.update_chunk_offsets_chunk64
     final_chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.final_chunk_indices_chunk64
     chunk_indices_large_block = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_large_block
+
+    # [EDGE-DEBUG] 打印点 1: 入口统计（cumsum 之前）
+    _DIAG_COUNTER["n"] += 1
+    _n = _DIAG_COUNTER["n"]
+    _capturing = _diag_capture_state()
+    _shape_str = (
+        f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)} "
+        f"g={tuple(g.shape)} beta={tuple(beta.shape)}"
+    )
+    _state_str = (
+        _diag_stats(initial_state, "init_state") if initial_state is not None else "init_state=None"
+    )
+    _cu_str = (
+        f"cu_seqlens_host={list(cu_seqlens_host)[:8]}"
+        if cu_seqlens_host is not None
+        else "cu_seqlens_host=None"
+    )
+    _ci_str = (
+        f"chunk_indices_host[:8]={list(chunk_indices_chunk64_host)[:8] if chunk_indices_chunk64_host is not None else None}"
+    )
+    _np = getattr(attn_metadata, "num_prefills", -1) if attn_metadata is not None else -1
+    _nd = getattr(attn_metadata, "num_decodes", -1) if attn_metadata is not None else -1
+    _diag.warning(
+        "[EDGE-DEBUG][gdn_fwd_enter] n=%d T=%d num_prefills=%s num_decodes=%s cudagraph_capturing=%s "
+        "shapes={%s} %s %s %s %s",
+        _n, int(k.shape[1]) if k.ndim >= 2 else -1, _np, _nd, _capturing,
+        _shape_str,
+        _diag_stats(k, "k"),
+        _diag_stats(g, "g"),
+        _diag_stats(beta, "beta"),
+        _state_str,
+    )
+    _diag.warning(
+        "[EDGE-DEBUG][gdn_fwd_enter_meta] n=%d %s %s",
+        _n, _cu_str, _ci_str,
+    )
+
     g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
         cu_seqlens=cu_seqlens,
         block_indices=block_indices_cumsum,
     )
+
+    # [EDGE-DEBUG] 打印点 2: cumsum 后 g_cumsum 统计
+    _diag.warning(
+        "[EDGE-DEBUG][gdn_after_cumsum] n=%d %s",
+        _n, _diag_stats(g, "g_cumsum"),
+    )
+
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
@@ -72,6 +151,13 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices_chunk64,
         output_dtype=torch.float32,
     )
+
+    # [EDGE-DEBUG] 打印点 3: KKT 算子输出 A
+    _diag.warning(
+        "[EDGE-DEBUG][gdn_after_kkt] n=%d %s",
+        _n, _diag_stats(A, "A_after_kkt"),
+    )
+
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens,
@@ -79,6 +165,13 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices_bt=chunk_indices_chunk64,
         output_dtype=k.dtype,
     )
+
+    # [EDGE-DEBUG] 打印点 4: solve_tril 后 A
+    _diag.warning(
+        "[EDGE-DEBUG][gdn_after_solve_tril] n=%d %s",
+        _n, _diag_stats(A, "A_after_solve_tril"),
+    )
+
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
@@ -87,6 +180,12 @@ def chunk_gated_delta_rule_fwd(
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices_chunk64,
+    )
+
+    # [EDGE-DEBUG] 打印点 5: recompute_w_u_fwd 后 w/u
+    _diag.warning(
+        "[EDGE-DEBUG][gdn_after_wu] n=%d %s %s",
+        _n, _diag_stats(w, "w"), _diag_stats(u, "u"),
     )
 
     k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
@@ -213,9 +312,21 @@ def chunk_gated_delta_rule_fwd(
         transpose_state_layout=False,
     )
 
+    # [EDGE-DEBUG] 打印点 6: chunk_fwd_o 输出
+    _diag.warning(
+        "[EDGE-DEBUG][gdn_after_fwd_o] n=%d %s",
+        _n, _diag_stats(o_ascendc, "o_after_fwd_o"),
+    )
+
     o = o_ascendc.to(torch.bfloat16).transpose(1, 2).contiguous()
     v_new = v_new.to(torch.bfloat16).transpose(1, 2).contiguous()
     h = h.to(torch.bfloat16).transpose(1, 2).contiguous()
+
+    # [EDGE-DEBUG] 打印点 7: final_state 是否被污染（下次请求会用）
+    _diag.warning(
+        "[EDGE-DEBUG][gdn_final_state] n=%d %s",
+        _n, _diag_stats(final_state, "final_state"),
+    )
 
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None

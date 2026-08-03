@@ -733,6 +733,17 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=True,
             )
             ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
+            # [EDGE-DEBUG] 打印 9: prefill 把 last_recurrent_state 写回
+            # ssm_state[prefill_state_indices] 之后，立刻回读该位置确认
+            # 写入是否如预期（对比 decode 时再读回的值，可以发现
+            # cudagraph capture / replay 错位问题）。
+            _diag2.warning(
+                "[EDGE-DEBUG][gdn_ssm_state_written] prefill_state_indices=%s "
+                "last_recurrent_state=%s ssm_state_at_indices=%s",
+                prefill_state_indices.tolist() if hasattr(prefill_state_indices, "tolist") else prefill_state_indices,
+                _gdn_stats(last_recurrent_state, "last_recurrent_state"),
+                _gdn_stats(ssm_state[prefill_state_indices], "ssm_state_written"),
+            )
             if split_non_spec:
                 core_attn_out_non_spec = torch.cat(
                     [core_attn_out_decode, core_attn_out_non_spec],
@@ -742,6 +753,31 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_non_spec = l2norm_fwd(query_non_spec)
             key_non_spec = l2norm_fwd(key_non_spec)
+            # [EDGE-DEBUG] 打印 10: decode 路径 npu_recurrent_gated_delta_rule
+            # 的输入与输出。只打前 200 次，避免 log 爆炸。
+            _decode_call_n = getattr(
+                self, "_edge_debug_decode_call_n", 0)
+            self._edge_debug_decode_call_n = _decode_call_n + 1
+            _do_log = _decode_call_n < 200
+            if _do_log:
+                _diag2.warning(
+                    "[EDGE-DEBUG][gdn_decode_in] call_n=%d "
+                    "non_spec_state_indices=%s actual_seq_lengths=%s "
+                    "%s %s %s %s %s ssm_state_full=%s",
+                    _decode_call_n,
+                    non_spec_state_indices_tensor.tolist()
+                    if hasattr(non_spec_state_indices_tensor, "tolist")
+                    else non_spec_state_indices_tensor,
+                    actual_seq_lengths.tolist()
+                    if hasattr(actual_seq_lengths, "tolist")
+                    else actual_seq_lengths,
+                    _gdn_stats(query_non_spec, "q"),
+                    _gdn_stats(key_non_spec, "k"),
+                    _gdn_stats(value_non_spec, "v"),
+                    _gdn_stats(g_non_spec, "g"),
+                    _gdn_stats(beta_non_spec, "beta"),
+                    _gdn_stats(ssm_state, "ssm_state_full"),
+                )
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
@@ -755,6 +791,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=non_spec_state_indices_tensor,
             ).unsqueeze(0)
+            if _do_log:
+                _diag2.warning(
+                    "[EDGE-DEBUG][gdn_decode_out] call_n=%d %s "
+                    "ssm_state_full_after=%s",
+                    _decode_call_n,
+                    _gdn_stats(core_attn_out_non_spec, "core_attn_out"),
+                    _gdn_stats(ssm_state, "ssm_state_full_after"),
+                )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 

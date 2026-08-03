@@ -758,29 +758,56 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             key_non_spec = l2norm_fwd(key_non_spec)
             # [EDGE-DEBUG] 打印 10: decode 路径 npu_recurrent_gated_delta_rule
             # 的输入与输出。只打前 200 次，避免 log 爆炸。
+            # 注意：decode 路径可能被 cudagraph capture，此时不能调用
+            # .tolist() / .item()（会触发 D2H 同步拷贝，capture 模式禁止）。
+            # 因此在 capture 中只打 stats（sum/absmax 也可能受限，先做最严
+            # 格的判断：如果在 capture 中，整个 log 跳过）。
             _decode_call_n = getattr(
                 self, "_edge_debug_decode_call_n", 0)
             self._edge_debug_decode_call_n = _decode_call_n + 1
             _do_log = _decode_call_n < 200
+            # 探测 cudagraph capture 状态（提前到 if 外，保证作用域）
+            _in_capture = False
             if _do_log:
-                _diag2.warning(
-                    "[EDGE-DEBUG][gdn_decode_in] call_n=%d "
-                    "non_spec_state_indices=%s actual_seq_lengths=%s "
-                    "%s %s %s %s %s ssm_state_full=%s",
-                    _decode_call_n,
-                    non_spec_state_indices_tensor.tolist()
-                    if hasattr(non_spec_state_indices_tensor, "tolist")
-                    else non_spec_state_indices_tensor,
-                    actual_seq_lengths.tolist()
-                    if hasattr(actual_seq_lengths, "tolist")
-                    else actual_seq_lengths,
-                    _gdn_stats(query_non_spec, "q"),
-                    _gdn_stats(key_non_spec, "k"),
-                    _gdn_stats(value_non_spec, "v"),
-                    _gdn_stats(g_non_spec, "g"),
-                    _gdn_stats(beta_non_spec, "beta"),
-                    _gdn_stats(ssm_state, "ssm_state_full"),
-                )
+                try:
+                    from vllm.compilation.monitor import (
+                        validate_cudagraph_capturing_enabled,
+                    )
+                    try:
+                        validate_cudagraph_capturing_enabled()
+                        _in_capture = True
+                    except Exception:
+                        _in_capture = False
+                except Exception:
+                    _in_capture = False
+            if _do_log:
+                if _in_capture:
+                    # Capture 模式下完全跳过日志（任何 .item()/.tolist() 都
+                    # 可能触发同步）
+                    _diag2.warning(
+                        "[EDGE-DEBUG][gdn_decode_in] call_n=%d "
+                        "(skipped stats: cudagraph capture active)",
+                        _decode_call_n,
+                    )
+                else:
+                    _diag2.warning(
+                        "[EDGE-DEBUG][gdn_decode_in] call_n=%d "
+                        "non_spec_state_indices=%s actual_seq_lengths=%s "
+                        "%s %s %s %s %s ssm_state_full=%s",
+                        _decode_call_n,
+                        non_spec_state_indices_tensor.tolist()
+                        if hasattr(non_spec_state_indices_tensor, "tolist")
+                        else non_spec_state_indices_tensor,
+                        actual_seq_lengths.tolist()
+                        if hasattr(actual_seq_lengths, "tolist")
+                        else actual_seq_lengths,
+                        _gdn_stats(query_non_spec, "q"),
+                        _gdn_stats(key_non_spec, "k"),
+                        _gdn_stats(value_non_spec, "v"),
+                        _gdn_stats(g_non_spec, "g"),
+                        _gdn_stats(beta_non_spec, "beta"),
+                        _gdn_stats(ssm_state, "ssm_state_full"),
+                    )
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
@@ -794,7 +821,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=non_spec_state_indices_tensor,
             ).unsqueeze(0)
-            if _do_log:
+            if _do_log and not _in_capture:
                 _diag2.warning(
                     "[EDGE-DEBUG][gdn_decode_out] call_n=%d %s "
                     "ssm_state_full_after=%s",

@@ -131,6 +131,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -7880,6 +7881,55 @@ class NPUModelRunner(GPUModelRunner):
         finally:
             self.supports_mm_inputs = original_supports_mm_inputs
             self.max_num_tokens = origin_max_num_tokens
+
+        # [EDGE-FIX] GDN pre-warmup:
+        # Run a dummy GDN prefill on every AscendGatedDeltaNetAttention layer
+        # *after* profile_run (which performs cudagraph capture) so that
+        # the steady-state kernel binary is populated and the first real
+        # request's prefill avoids the CAPTURE-phase KKT non-determinism.
+        #
+        # Only relevant on the edge rank of an edge-cloud deployment; the
+        # cloud rank does not run the GDN chunk path.
+        if self._edge_cloud_enabled and self.edge_cloud_cfg.role == "edge":
+            self._gdn_pre_warmup()
+
+    def _gdn_pre_warmup(self) -> None:
+        """Run a single dummy GDN prefill on every GDN layer.
+
+        Equivalent to what upstream vLLM does in
+        ``QwenGatedDeltaNetAttention._warmup_prefill_kernels`` but driven
+        from the model runner so we can guarantee it happens *after*
+        cudagraph capture.
+
+        Disabled by setting ``VLLM_ASCEND_GDN_PRE_WARMUP=0``.
+        """
+        if not ascend_envs.VLLM_ASCEND_GDN_PRE_WARMUP:
+            return
+        from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+        layers = [
+            m for m in self.model.modules()
+            if isinstance(m, AscendGatedDeltaNetAttention)
+        ]
+        if not layers:
+            return
+        # Build one dummy qkvz tensor and feed every layer with the same
+        # shape; each layer re-uses it as a layout/stride template.
+        sample = layers[0]
+        qkvz_dim = (
+            (sample.key_dim * 2 + sample.value_dim) // sample.tp_size
+            + sample.value_dim // sample.tp_size
+        )
+        device = next(self.model.parameters()).device
+        dtype = next(self.model.parameters()).dtype
+        dummy = torch.zeros(64, qkvz_dim, device=device, dtype=dtype)
+        for layer in layers:
+            try:
+                layer._warmup_prefill_kernels(dummy, v_dim=0)
+            except Exception as e:
+                logger.warning(
+                    "GDN pre-warmup failed for layer %s: %s",
+                    layer.prefix, e, exc_info=True,
+                )
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:

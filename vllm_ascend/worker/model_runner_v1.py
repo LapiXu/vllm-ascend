@@ -4452,43 +4452,68 @@ class NPUModelRunner(GPUModelRunner):
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
-                # [EDGE-DEBUG] 打印前几次的 hidden state + logits，
-                # 用于对比首请求与稳态请求。如果首请求的 hidden state
-                # 跟稳态不同 → GDN 之前的层有 first-launch 非确定性。
-                # 如果 hidden state 相同但 logits 不同 → LM head (compute_logits)
-                # 有 first-launch 非确定性。两种都不同 → 多层都有问题。
-                _dbg_n = getattr(self, "_edge_debug_logits_call_n", 0)
-                self._edge_debug_logits_call_n = _dbg_n + 1
-                if _dbg_n < 6:
-                    try:
-                        _sh = sample_hidden_states.detach().float()
-                        _lg = logits.detach().float()
-                        _req_ids = list(self.input_batch.req_ids)[:3]
-                        for _ri, _rid in enumerate(_req_ids):
-                            _h = _sh[_ri]
-                            _l = _lg[_ri]
-                            _top5 = _l.topk(5)
-                            _top5_ids = _top5.indices.tolist()
-                            _top5_vals = _top5.values.tolist()
-                            logger.warning(
-                                "[EDGE-DEBUG][logits] call_n=%d req_idx=%d "
-                                "req_id=%s num_sched_tokens=%d "
-                                "hidden_state_sum=%.4f hidden_state_absmax=%.4f "
-                                "logits_top5_ids=%s logits_top5_vals=%s",
-                                _dbg_n, _ri, _rid,
-                                int(scheduler_output.num_scheduled_tokens[
-                                    self.input_batch.req_id_to_index[_rid]
-                                ]) if _rid in self.input_batch.req_id_to_index else -1,
-                                _h.sum().item(),
-                                _h.abs().max().item(),
-                                _top5_ids,
-                                [round(v, 4) for v in _top5_vals],
-                            )
-                    except Exception as ex:
-                        logger.warning(
-                            "[EDGE-DEBUG][logits] call_n=%d log failed: %s",
-                            _dbg_n, type(ex).__name__,
+                # [EDGE-DEBUG] 打印每个请求的 prefill + 前 3 个 decode 的
+                # hidden state 和 logits。用于对比首请求与稳态请求：
+                # - prefill hidden state 跟稳态不同 → GDN 之前有 first-launch
+                # - prefill hidden state 相同但 logits 不同 → LM head 有问题
+                # - prefill 完全相同，但首请求第一次 decode 的 logits 异常
+                #   → 采样器/attention 有问题
+                _dbg_call_n = getattr(self, "_edge_debug_logits_call_n", 0)
+                self._edge_debug_logits_call_n = _dbg_call_n + 1
+                _dbg_n_prefills = getattr(
+                    self, "_edge_debug_n_prefills", 0)
+                _dbg_decode_counts = getattr(
+                    self, "_edge_debug_decode_counts", {})
+                try:
+                    _sh = sample_hidden_states.detach().float()
+                    _lg = logits.detach().float()
+                    _req_ids = list(self.input_batch.req_ids)[:3]
+                    for _ri, _rid in enumerate(_req_ids):
+                        _nst = (
+                            int(scheduler_output.num_scheduled_tokens[_ri])
+                            if _ri < len(scheduler_output.num_scheduled_tokens)
+                            else -1
                         )
+                        # 策略：每个请求都打 prefill + 前 3 个 decode，
+                        # 但 prefill 全打（最多 4 个，避免无限打），decode
+                        # 按 request 计数。这样第二个请求的 prefill 也能打到。
+                        if _nst > 1:  # prefill
+                            if _dbg_n_prefills >= 4:
+                                continue
+                            _dbg_n_prefills += 1
+                            _kind = "prefill"
+                        elif _nst == 1:  # decode
+                            _cnt = _dbg_decode_counts.get(_rid, 0)
+                            if _cnt >= 3:
+                                continue
+                            _dbg_decode_counts[_rid] = _cnt + 1
+                            _kind = f"decode#{_cnt}"
+                        else:
+                            continue
+
+                        _h = _sh[_ri]
+                        _l = _lg[_ri]
+                        _top5 = _l.topk(5)
+                        _top5_ids = _top5.indices.tolist()
+                        _top5_vals = _top5.values.tolist()
+                        logger.warning(
+                            "[EDGE-DEBUG][logits] call_n=%d req_idx=%d "
+                            "req_id=%s kind=%s num_sched_tokens=%d "
+                            "hidden_state_sum=%.4f hidden_state_absmax=%.4f "
+                            "logits_top5_ids=%s logits_top5_vals=%s",
+                            _dbg_call_n, _ri, _rid, _kind, _nst,
+                            _h.sum().item(),
+                            _h.abs().max().item(),
+                            _top5_ids,
+                            [round(v, 4) for v in _top5_vals],
+                        )
+                    self._edge_debug_n_prefills = _dbg_n_prefills
+                    self._edge_debug_decode_counts = _dbg_decode_counts
+                except Exception as ex:
+                    logger.warning(
+                        "[EDGE-DEBUG][logits] call_n=%d log failed: %s",
+                        _dbg_call_n, type(ex).__name__,
+                    )
             else:
                 # Rare case.
                 assert not self.is_pooling_model

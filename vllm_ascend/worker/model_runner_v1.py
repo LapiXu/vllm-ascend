@@ -7929,9 +7929,8 @@ class NPUModelRunner(GPUModelRunner):
 
         layers = [m for m in self.model.modules() if _is_gdn_layer(m)]
         logger.info(
-            "[EDGE-FIX] GDN pre-warmup: found %d GDN layer(s) on rank %d",
+            "[EDGE-FIX] GDN pre-warmup: found %d GDN layer(s)",
             len(layers),
-            self.rank,
         )
         if not layers:
             return

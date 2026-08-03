@@ -675,6 +675,22 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_decode = None
 
         # 2.3: Process the remaining part
+        # [EDGE-DEBUG] 诊断 logger 和 _gdn_stats 工具函数。
+        # 把它们挪到 if/elif 之外，避免 decode 路径单独走时
+        # '_diag2' 未定义的错误。
+        import logging as _diag_log2
+        _diag2 = _diag_log2.getLogger("vllm_ascend.diag")
+
+        def _gdn_stats(t, prefix):
+            if t is None:
+                return f"{prefix}=None"
+            tf = t.detach().float()
+            return (
+                f"{prefix}_sum={tf.sum().item():.6f} "
+                f"{prefix}_absmax={tf.abs().max().item():.6f} "
+                f"finite={bool(torch.isfinite(tf).all().item())}"
+            )
+
         if attn_metadata.num_prefills > 0:
             prefill_query_start_loc = attn_metadata.prefill_query_start_loc
             prefill_state_indices = attn_metadata.prefill_state_indices
@@ -693,19 +709,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
             initial_state = ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
             # [EDGE-DEBUG] 打印 8: 进入本次请求时 ssm_state / initial_state 的统计
-            import logging as _diag_log2
-            _diag2 = _diag_log2.getLogger("vllm_ascend.diag")
-
-            def _gdn_stats(t, prefix):
-                if t is None:
-                    return f"{prefix}=None"
-                tf = t.detach().float()
-                return (
-                    f"{prefix}_sum={tf.sum().item():.6f} "
-                    f"{prefix}_absmax={tf.abs().max().item():.6f} "
-                    f"finite={bool(torch.isfinite(tf).all().item())}"
-                )
-
             _diag2.warning(
                 "[EDGE-DEBUG][gdn_in_initial_state] prefill_state_indices=%s "
                 "prefill_has_initial_state=%s %s %s",

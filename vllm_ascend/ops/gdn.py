@@ -758,36 +758,34 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             key_non_spec = l2norm_fwd(key_non_spec)
             # [EDGE-DEBUG] 打印 10: decode 路径 npu_recurrent_gated_delta_rule
             # 的输入与输出。只打前 200 次，避免 log 爆炸。
-            # 注意：decode 路径可能被 cudagraph capture，此时不能调用
-            # .tolist() / .item()（会触发 D2H 同步拷贝，capture 模式禁止）。
-            # 因此在 capture 中只打 stats（sum/absmax 也可能受限，先做最严
-            # 格的判断：如果在 capture 中，整个 log 跳过）。
+            # 判断"是否在 cudagraph 上下文中"：通过 forward_context 的
+            # cudagraph_runtime_mode 字段（mode != NONE 表示当前 forward
+            # pass 由 cudagraph 包装，可能是 capture 或 replay）。
+            # 之前用 vllm.compilation.monitor.validate_cudagraph_capturing_enabled
+            # 是错的：它只检查一个全局 bool 标志（永远 True），不是
+            # 真正的 capture 状态，会让所有 decode 日志都被屏蔽。
             _decode_call_n = getattr(
                 self, "_edge_debug_decode_call_n", 0)
             self._edge_debug_decode_call_n = _decode_call_n + 1
             _do_log = _decode_call_n < 200
-            # 探测 cudagraph capture 状态（提前到 if 外，保证作用域）
-            _in_capture = False
+            _in_cudagraph = False
             if _do_log:
                 try:
-                    from vllm.compilation.monitor import (
-                        validate_cudagraph_capturing_enabled,
-                    )
-                    try:
-                        validate_cudagraph_capturing_enabled()
-                        _in_capture = True
-                    except Exception:
-                        _in_capture = False
+                    from vllm.forward_context import get_forward_context
+                    _fc = get_forward_context()
+                    if _fc is not None:
+                        _mode = getattr(_fc, "cudagraph_runtime_mode", None)
+                        if _mode is not None and str(_mode) != "CUDAGraphMode.NONE":
+                            _in_cudagraph = True
                 except Exception:
-                    _in_capture = False
+                    _in_cudagraph = False
             if _do_log:
-                if _in_capture:
-                    # Capture 模式下完全跳过日志（任何 .item()/.tolist() 都
-                    # 可能触发同步）
+                if _in_cudagraph:
                     _diag2.warning(
                         "[EDGE-DEBUG][gdn_decode_in] call_n=%d "
-                        "(skipped stats: cudagraph capture active)",
+                        "(skipped stats: cudagraph mode=%s)",
                         _decode_call_n,
+                        str(_mode),
                     )
                 else:
                     _diag2.warning(
@@ -821,7 +819,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=non_spec_state_indices_tensor,
             ).unsqueeze(0)
-            if _do_log and not _in_capture:
+            if _do_log and not _in_cudagraph:
                 _diag2.warning(
                     "[EDGE-DEBUG][gdn_decode_out] call_n=%d %s "
                     "ssm_state_full_after=%s",

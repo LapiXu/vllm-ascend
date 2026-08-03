@@ -347,6 +347,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         state = torch.zeros(1, num_v_heads, V, K, device=device, dtype=state_dtype)
         cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
 
+        # chunk_gated_delta_rule_fwd() in chunk.py:79 calls
+        # get_forward_context() unconditionally to fetch num_decodes.
+        # In profile_run there is no active forward context, so we
+        # install a minimal one (attn_metadata=None) for the duration of
+        # the warmup call.
+        from types import SimpleNamespace
+        from vllm import forward_context as _fc_mod
+        prev_fc = _fc_mod._forward_context
+        _fc_mod._forward_context = SimpleNamespace(attn_metadata=None)
         try:
             chunk_gated_delta_rule(
                 q=q,
@@ -376,6 +385,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.prefix,
             )
         finally:
+            _fc_mod._forward_context = prev_fc
             del q, k, v, g, beta, state, cu_seqlens
 
         torch.accelerator.empty_cache()

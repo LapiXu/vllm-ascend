@@ -18,142 +18,109 @@ vllm.model_executor.layers.fla.ops.fused_recurrent.fused_recurrent_gated_delta_r
 vllm.model_executor.layers.fla.ops.layernorm_guard.LayerNormFn = LayerNormFn
 vllm.model_executor.layers.fla.ops.chunk_gated_delta_rule = chunk_gated_delta_rule
 
-# [EDGE-DEBUG][方案J] Always replace the Triton-based fused_post_conv_prep /
-# fused_recurrent_gated_delta_rule_packed_decode with the pure-PyTorch fallback
-# on NPU.  The Triton kernels have a cold-launch bug on NPU 910B (first call
-# after service start returns garbage regardless of cudagraph or eager mode),
-# which manifests as garbled n=1 decode output.
-import torch
-import torch.nn.functional as _F
+# On NPU platforms without an active Triton backend (e.g. 310P), replace the
+# Triton-based fused_post_conv_prep with a pure-PyTorch fallback so that
+# qwen_gdn_linear_attn's from-import picks up the replacement before model
+# load.
+if not HAS_TRITON:
+    import torch
+    import torch.nn.functional as _F
 
+    def _fused_post_conv_prep_pytorch(
+        conv_output,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        num_k_heads,
+        head_k_dim,
+        head_v_dim,
+        apply_l2norm=True,
+        output_g_exp=False,
+    ):
+        L = conv_output.shape[0]
+        H, K, V = num_k_heads, head_k_dim, head_v_dim
+        HV = A_log.shape[0]
 
-def _fused_post_conv_prep_pytorch(
-    conv_output,
-    a,
-    b,
-    A_log,
-    dt_bias,
-    num_k_heads,
-    head_k_dim,
-    head_v_dim,
-    apply_l2norm=True,
-    output_g_exp=False,
-):
-    L = conv_output.shape[0]
-    H, K, V = num_k_heads, head_k_dim, head_v_dim
-    HV = A_log.shape[0]
+        q = conv_output[:, : H * K].reshape(L, H, K)
+        k = conv_output[:, H * K : 2 * H * K].reshape(L, H, K)
+        v = conv_output[:, 2 * H * K :].reshape(L, HV, V)
 
-    q = conv_output[:, : H * K].reshape(L, H, K)
-    k = conv_output[:, H * K : 2 * H * K].reshape(L, H, K)
-    v = conv_output[:, 2 * H * K :].reshape(L, HV, V)
-
-    if apply_l2norm:
-        # x / sqrt(sum(x^2) + eps) — matches Triton kernel, in fp32
-        def _l2norm(t):
-            t_f = t.float()
-            return (t_f / torch.sqrt((t_f * t_f).sum(-1, keepdim=True) + 1e-6)).to(t.dtype)
-
-        q, k = _l2norm(q), _l2norm(k)
-
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-
-    x = (a + dt_bias.unsqueeze(0)).float()
-    g = -torch.exp(A_log.float().unsqueeze(0)) * _F.softplus(x)
-    if output_g_exp:
-        g = torch.exp(g)
-
-    return q, k, v, g, torch.sigmoid(b.float())
-
-
-def _fused_recurrent_packed_decode_pytorch(
-    mixed_qkv,
-    a,
-    b,
-    A_log,
-    dt_bias,
-    scale,
-    initial_state,
-    out,
-    ssm_state_indices,
-    use_qk_l2norm_in_kernel=False,
-):
-    B = mixed_qkv.shape[0]
-    HV, V, K = initial_state.shape[-3:]
-    H = (mixed_qkv.shape[1] - HV * V) // (2 * K)
-    ratio = HV // H
-
-    q = mixed_qkv[:, : H * K].reshape(B, H, K)
-    k = mixed_qkv[:, H * K : 2 * H * K].reshape(B, H, K)
-    v = mixed_qkv[:, 2 * H * K :].reshape(B, HV, V)
-
-    SOFTPLUS_THRESHOLD = 20.0
-    x = (a + dt_bias.unsqueeze(0)).float()
-    softplus_x = torch.where(x <= SOFTPLUS_THRESHOLD, torch.log1p(torch.exp(x)), x)
-    g = -torch.exp(A_log.float().unsqueeze(0)) * softplus_x  # [B, HV]
-    beta = torch.sigmoid(b.float())  # [B, HV]
-
-    for n in range(B):
-        state_idx = int(ssm_state_indices[n].item())
-        if state_idx <= 0:
-            out[n, 0] = 0
-            continue
-
-        h = initial_state[state_idx].float()  # [HV, V, K]
-        q_n = q[n].float().repeat_interleave(ratio, dim=0)  # [HV, K]
-        k_n = k[n].float().repeat_interleave(ratio, dim=0)  # [HV, K]
-        v_n = v[n].float()  # [HV, V]
-
-        if use_qk_l2norm_in_kernel:
-
+        if apply_l2norm:
+            # x / sqrt(sum(x^2) + eps) — matches Triton kernel, in fp32
             def _l2norm(t):
                 t_f = t.float()
-                return t_f / torch.sqrt((t_f * t_f).sum(-1, keepdim=True) + 1e-6)
+                return (t_f / torch.sqrt((t_f * t_f).sum(-1, keepdim=True) + 1e-6)).to(t.dtype)
 
-            q_n, k_n = _l2norm(q_n), _l2norm(k_n)
-        q_n = q_n * scale
+            q, k = _l2norm(q), _l2norm(k)
 
-        h = h * torch.exp(g[n]).view(HV, 1, 1)
-        v_n = v_n - torch.einsum("hvk,hk->hv", h, k_n)
-        v_n = v_n * beta[n].view(HV, 1)
-        h = h + torch.einsum("hv,hk->hvk", v_n, k_n)
-        out[n, 0] = torch.einsum("hvk,hk->hv", h, q_n).to(out.dtype)
-        initial_state[state_idx] = h.to(initial_state.dtype)
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
-    return out, initial_state
+        x = (a + dt_bias.unsqueeze(0)).float()
+        g = -torch.exp(A_log.float().unsqueeze(0)) * _F.softplus(x)
+        if output_g_exp:
+            g = torch.exp(g)
 
+        return q, k, v, g, torch.sigmoid(b.float())
 
-# [EDGE-DEBUG][方案J] 注入 pytorch fallback（不依赖 HAS_TRITON）
-# 必须同时设置子模块属性和父模块命名空间属性,
-# 否则 qwen_gdn_linear_attn.py 的 `from ... import ...` 拿到的是 import 时刻
-# 复制到父模块命名空间的旧引用 (Triton 版本), 修改子模块属性不生效.
-import logging as _patch_log
-import vllm.model_executor.layers.fla.ops as _fla_ops
-import vllm.model_executor.layers.fla.ops.fused_recurrent as _fla_recurrent
-import vllm.model_executor.layers.fla.ops.fused_gdn_prefill_post_conv as _fla_prefill
+    vllm.model_executor.layers.fla.ops.fused_post_conv_prep = _fused_post_conv_prep_pytorch
 
-_patch_log.getLogger("vllm_ascend.diag").warning(
-    "[EDGE-DEBUG][方案J] 强制注入 pytorch fallback 替代 packed_decode Triton kernel "
-    "(原条件: if not HAS_TRITON, 当前 HAS_TRITON=%s)", HAS_TRITON
-)
+    def _fused_recurrent_packed_decode_pytorch(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        scale,
+        initial_state,
+        out,
+        ssm_state_indices,
+        use_qk_l2norm_in_kernel=False,
+    ):
+        B = mixed_qkv.shape[0]
+        HV, V, K = initial_state.shape[-3:]
+        H = (mixed_qkv.shape[1] - HV * V) // (2 * K)
+        ratio = HV // H
 
-# 1) 替换子模块实现 (如果后续还有 `from fused_recurrent import X` 会拿到新值)
-_fla_recurrent.fused_recurrent_gated_delta_rule_packed_decode = _fused_recurrent_packed_decode_pytorch
-_fla_prefill.fused_post_conv_prep = _fused_post_conv_prep_pytorch
+        q = mixed_qkv[:, : H * K].reshape(B, H, K)
+        k = mixed_qkv[:, H * K : 2 * H * K].reshape(B, H, K)
+        v = mixed_qkv[:, 2 * H * K :].reshape(B, HV, V)
 
-# 2) 替换父模块命名空间属性 (让已经 `from vllm.model_executor.layers.fla.ops import X`
-#    复制过的旧引用也指向新对象)
-_fla_ops.fused_recurrent_gated_delta_rule_packed_decode = _fused_recurrent_packed_decode_pytorch
-_fla_ops.fused_post_conv_prep = _fused_post_conv_prep_pytorch
+        SOFTPLUS_THRESHOLD = 20.0
+        x = (a + dt_bias.unsqueeze(0)).float()
+        softplus_x = torch.where(x <= SOFTPLUS_THRESHOLD, torch.log1p(torch.exp(x)), x)
+        g = -torch.exp(A_log.float().unsqueeze(0)) * softplus_x  # [B, HV]
+        beta = torch.sigmoid(b.float())  # [B, HV]
 
-# 3) 验证: 检查父模块属性确实换了
-assert (
-    _fla_ops.fused_recurrent_gated_delta_rule_packed_decode
-    is _fused_recurrent_packed_decode_pytorch
-), "方案J 注入失败: 父模块命名空间属性替换未生效"
-assert (
-    _fla_ops.fused_post_conv_prep is _fused_post_conv_prep_pytorch
-), "方案J 注入失败: fused_post_conv_prep 父模块命名空间属性替换未生效"
-_patch_log.getLogger("vllm_ascend.diag").warning(
-    "[EDGE-DEBUG][方案J] 注入验证通过: packed_decode/fused_post_conv_prep "
-    "父模块命名空间属性已替换为 pytorch fallback"
-)
+        for n in range(B):
+            state_idx = int(ssm_state_indices[n].item())
+            if state_idx <= 0:
+                out[n, 0] = 0
+                continue
+
+            h = initial_state[state_idx].float()  # [HV, V, K]
+            q_n = q[n].float().repeat_interleave(ratio, dim=0)  # [HV, K]
+            k_n = k[n].float().repeat_interleave(ratio, dim=0)  # [HV, K]
+            v_n = v[n].float()  # [HV, V]
+
+            if use_qk_l2norm_in_kernel:
+
+                def _l2norm(t):
+                    t_f = t.float()
+                    return t_f / torch.sqrt((t_f * t_f).sum(-1, keepdim=True) + 1e-6)
+
+                q_n, k_n = _l2norm(q_n), _l2norm(k_n)
+            q_n = q_n * scale
+
+            h = h * torch.exp(g[n]).view(HV, 1, 1)
+            v_n = v_n - torch.einsum("hvk,hk->hv", h, k_n)
+            v_n = v_n * beta[n].view(HV, 1)
+            h = h + torch.einsum("hv,hk->hvk", v_n, k_n)
+            out[n, 0] = torch.einsum("hvk,hk->hv", h, q_n).to(out.dtype)
+            initial_state[state_idx] = h.to(initial_state.dtype)
+
+        return out, initial_state
+
+    vllm.model_executor.layers.fla.ops.fused_recurrent.fused_recurrent_gated_delta_rule_packed_decode = (
+        _fused_recurrent_packed_decode_pytorch
+    )

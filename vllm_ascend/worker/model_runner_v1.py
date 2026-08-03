@@ -4453,11 +4453,7 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
                 # [EDGE-DEBUG] 打印每个请求的 prefill + 前 3 个 decode 的
-                # hidden state 和 logits。用于对比首请求与稳态请求：
-                # - prefill hidden state 跟稳态不同 → GDN 之前有 first-launch
-                # - prefill hidden state 相同但 logits 不同 → LM head 有问题
-                # - prefill 完全相同，但首请求第一次 decode 的 logits 异常
-                #   → 采样器/attention 有问题
+                # hidden state 和 logits。用于对比首请求与稳态请求。
                 _dbg_call_n = getattr(self, "_edge_debug_logits_call_n", 0)
                 self._edge_debug_logits_call_n = _dbg_call_n + 1
                 _dbg_n_prefills = getattr(
@@ -4469,14 +4465,14 @@ class NPUModelRunner(GPUModelRunner):
                     _lg = logits.detach().float()
                     _req_ids = list(self.input_batch.req_ids)[:3]
                     for _ri, _rid in enumerate(_req_ids):
-                        _nst = (
-                            int(scheduler_output.num_scheduled_tokens[_ri])
-                            if _ri < len(scheduler_output.num_scheduled_tokens)
-                            else -1
-                        )
-                        # 策略：每个请求都打 prefill + 前 3 个 decode，
-                        # 但 prefill 全打（最多 4 个，避免无限打），decode
-                        # 按 request 计数。这样第二个请求的 prefill 也能打到。
+                        # num_scheduled_tokens 是 dict[req_id, int]，
+                        # 之前误用 _ri 当 index → KeyError。现在用 _rid
+                        # 当 key。如果 key 不在 dict 里（连续 batching 边
+                        # 缘情况），跳过这个 request。
+                        _nst_dict = scheduler_output.num_scheduled_tokens
+                        if _rid not in _nst_dict:
+                            continue
+                        _nst = int(_nst_dict[_rid])
                         if _nst > 1:  # prefill
                             if _dbg_n_prefills >= 4:
                                 continue

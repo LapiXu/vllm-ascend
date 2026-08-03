@@ -756,50 +756,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_non_spec = l2norm_fwd(query_non_spec)
             key_non_spec = l2norm_fwd(key_non_spec)
-            # [EDGE-DEBUG] 打印 10: decode 路径 npu_recurrent_gated_delta_rule
-            # 的输入与输出。只打前 200 次，避免 log 爆炸。
-            # 判断"是否在 cudagraph 上下文中"：通过 forward_context 的
-            # cudagraph_runtime_mode 字段（mode != NONE 表示当前 forward
-            # pass 由 cudagraph 包装，可能是 capture 或 replay）。
-            # 之前用 vllm.compilation.monitor.validate_cudagraph_capturing_enabled
-            # 是错的：它只检查一个全局 bool 标志（永远 True），不是
-            # 真正的 capture 状态，会让所有 decode 日志都被屏蔽。
-            _decode_call_n = getattr(
-                self, "_edge_debug_decode_call_n", 0)
-            self._edge_debug_decode_call_n = _decode_call_n + 1
-            _do_log = _decode_call_n < 200
-            # 完全去掉 cudagraph 模式预检测：直接尝试打 stats，
-            # 任何 .item() 失败就降级。capture / replay 模式都能尝试，
-            # 让运行时决定（replay 模式下 .item() 应可工作）。
-            if _do_log:
-                try:
-                    _msg = (
-                        "[EDGE-DEBUG][gdn_decode_in] call_n=%d "
-                        "non_spec_state_indices=%s actual_seq_lengths=%s "
-                        "%s %s %s %s %s ssm_state_full=%s"
-                    ) % (
-                        _decode_call_n,
-                        non_spec_state_indices_tensor.tolist()
-                        if hasattr(non_spec_state_indices_tensor, "tolist")
-                        else non_spec_state_indices_tensor,
-                        actual_seq_lengths.tolist()
-                        if hasattr(actual_seq_lengths, "tolist")
-                        else actual_seq_lengths,
-                        _gdn_stats(query_non_spec, "q"),
-                        _gdn_stats(key_non_spec, "k"),
-                        _gdn_stats(value_non_spec, "v"),
-                        _gdn_stats(g_non_spec, "g"),
-                        _gdn_stats(beta_non_spec, "beta"),
-                        _gdn_stats(ssm_state, "ssm_state_full"),
-                    )
-                    _diag2.warning(_msg)
-                except Exception as ex:
-                    _diag2.warning(
-                        "[EDGE-DEBUG][gdn_decode_in] call_n=%d "
-                        "(stats unavailable: %s)",
-                        _decode_call_n,
-                        type(ex).__name__,
-                    )
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
@@ -813,22 +769,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=non_spec_state_indices_tensor,
             ).unsqueeze(0)
-            if _do_log:
-                try:
-                    _diag2.warning(
-                        "[EDGE-DEBUG][gdn_decode_out] call_n=%d %s "
-                        "ssm_state_full_after=%s",
-                        _decode_call_n,
-                        _gdn_stats(core_attn_out_non_spec, "core_attn_out"),
-                        _gdn_stats(ssm_state, "ssm_state_full_after"),
-                    )
-                except Exception as ex:
-                    _diag2.warning(
-                        "[EDGE-DEBUG][gdn_decode_out] call_n=%d "
-                        "(stats unavailable: %s)",
-                        _decode_call_n,
-                        type(ex).__name__,
-                    )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 

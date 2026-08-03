@@ -771,7 +771,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             _in_cudagraph = False
             if _do_log:
                 try:
-                    from vllm.forward_context import get_forward_context
+                    # NOTE: 不能在函数体内 import get_forward_context，
+                    # 会让同函数其他位置的 get_forward_context 变成
+                    # UnboundLocalError。直接用顶部 module-level 引用。
                     _fc = get_forward_context()
                     if _fc is not None:
                         _mode = getattr(_fc, "cudagraph_runtime_mode", None)

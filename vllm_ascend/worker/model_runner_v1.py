@@ -7904,12 +7904,35 @@ class NPUModelRunner(GPUModelRunner):
         Disabled by setting ``VLLM_ASCEND_GDN_PRE_WARMUP=0``.
         """
         if not ascend_envs.VLLM_ASCEND_GDN_PRE_WARMUP:
+            logger.info("[EDGE-FIX] GDN pre-warmup disabled by env var")
             return
+        # NOTE: vllm-ascend monkey-patches methods onto the upstream
+        # QwenGatedDeltaNetAttention, so the actual runtime instances are
+        # of the upstream class, not AscendGatedDeltaNetAttention. Match
+        # both to be safe (the latter would only match if a future change
+        # instantiates AscendGatedDeltaNetAttention directly).
+        try:
+            from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+                QwenGatedDeltaNetAttention,
+            )
+        except ImportError:
+            QwenGatedDeltaNetAttention = None
         from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
-        layers = [
-            m for m in self.model.modules()
-            if isinstance(m, AscendGatedDeltaNetAttention)
-        ]
+
+        def _is_gdn_layer(m):
+            if QwenGatedDeltaNetAttention is not None and isinstance(
+                    m, QwenGatedDeltaNetAttention):
+                return True
+            if isinstance(m, AscendGatedDeltaNetAttention):
+                return True
+            return False
+
+        layers = [m for m in self.model.modules() if _is_gdn_layer(m)]
+        logger.info(
+            "[EDGE-FIX] GDN pre-warmup: found %d GDN layer(s) on rank %d",
+            len(layers),
+            self.rank,
+        )
         if not layers:
             return
         # Build one dummy qkvz tensor and feed every layer with the same

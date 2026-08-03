@@ -102,13 +102,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_gmm_combine_decode` can be used only for **decode node** moe layer
     # with W8A8. And MTP layer must be W8A8.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
-    # [EDGE-FIX] Enable a one-shot dummy GDN prefill on every GDN layer after
-    # profile_run. The first real user request therefore hits the steady-state
-    # kernel binary instead of the cudagraph CAPTURE binary, avoiding the
-    # KKT A non-determinism observed on Qwen3-27B edge-cloud (TP1 KKT sum
-    # drift up to 15%, which propagates to ssm_state and garbles the first
-    # request's reply). Set to 0 to disable.
-    "VLLM_ASCEND_GDN_PRE_WARMUP": lambda: int(os.getenv("VLLM_ASCEND_GDN_PRE_WARMUP", "1")),
     # DEPRECATED: VLLM_ASCEND_BALANCE_SCHEDULING env var will be removed in a future release.
     # Use --additional-config '{"enable_balance_scheduling": true}' instead.
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),

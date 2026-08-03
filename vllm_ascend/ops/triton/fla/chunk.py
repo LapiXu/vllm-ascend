@@ -34,6 +34,20 @@ _diag_log.getLogger("vllm_ascend.diag").setLevel(_diag_log.WARNING)
 _diag = _diag_log.getLogger("vllm_ascend.diag")
 _DIAG_COUNTER = {"n": 0}
 
+# [EDGE-FIX] First-call retry guard.
+# The NPU ``chunk_scaled_dot_kkt_fwd_kernel`` (Triton-on-NPU) is non-
+# deterministic on its very first launch: the KKT A tensor sum drifts up
+# to 15% on TP1 vs. the steady-state path.  This propagates through
+# solve_tril / recompute_w_u_fwd / fwd_o and corrupts the ssm_state
+# written for the first request, producing a garbled reply.
+#
+# To avoid this, we run ``chunk_gated_delta_rule_fwd`` once at the first
+# invocation and discard its result (forcing kernel compilation +
+# autotune), then run it again and use that output.  The cost is one
+# extra GDN prefill on the first user request (~10-50 ms); subsequent
+# calls take the fast path because the flag is already set.
+_FIRST_GDN_FWD_DONE = {"flag": False}
+
 
 def _diag_stats(t: torch.Tensor, prefix: str) -> str:
     """Compact tensor stats (sync). Use sparingly on hot path."""
@@ -378,6 +392,33 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
+        # [EDGE-FIX] First-call retry: drop the first chunk_gated_delta_rule_fwd
+        # output (which is non-deterministic on NPU) and re-run with the
+        # already-JIT'd kernels.  Inputs (q, k, g, beta, ...) are all either
+        # freshly produced (l2norm) or read-only at the function level, so
+        # the retry sees the same numerical inputs as the first call.
+        if not _FIRST_GDN_FWD_DONE["flag"]:
+            _FIRST_GDN_FWD_DONE["flag"] = True
+            _diag.warning(
+                "[EDGE-FIX][gdn_first_call_retry] discarding first "
+                "chunk_gated_delta_rule_fwd output to bypass KKT "
+                "first-launch non-determinism (T=%d H_k=%d H_v=%d)",
+                int(q.shape[1]) if q.ndim >= 2 else -1,
+                int(q.shape[2]) if q.ndim >= 3 else -1,
+                int(v.shape[2]) if v.ndim >= 3 else -1,
+            )
+            _ = chunk_gated_delta_rule_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                prebuilt_meta=prebuilt_meta,
+            )
         g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,

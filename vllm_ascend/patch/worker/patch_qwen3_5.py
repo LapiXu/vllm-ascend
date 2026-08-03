@@ -197,12 +197,6 @@ Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
 _GDN_PATCH_TARGET._split_ba_for_tp = AscendGatedDeltaNetAttention._split_ba_for_tp
 _GDN_PATCH_TARGET.get_state_shape = AscendGatedDeltaNetAttention.get_state_shape
 _GDN_PATCH_TARGET.get_attn_backend = AscendGatedDeltaNetAttention.get_attn_backend
-# [EDGE-FIX] Override no-op upstream warmup to do a real GDN prefill pass
-# so the first real request avoids KKT non-determinism in cudagraph capture.
-_GDN_PATCH_TARGET._warmup_prefill_kernels = (
-    AscendGatedDeltaNetAttention._warmup_prefill_kernels)
-_GDN_PATCH_TARGET._warmup_prefill_kernels_v0202 = (
-    AscendGatedDeltaNetAttention._warmup_prefill_kernels_v0202)
 
 if is_310p():
     from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310

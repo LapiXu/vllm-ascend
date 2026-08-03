@@ -15,13 +15,10 @@
 # limitations under the License.
 #
 
-import logging
 import torch
 from einops import rearrange
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
-
-logger = logging.getLogger(__name__)
 from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
@@ -303,103 +300,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
-        """Warm up GDN prefill kernels on Ascend.
-
-        Why we need this:
-            On NPU, the very first launch of ``chunk_scaled_dot_kkt_fwd_kernel``
-            during cudagraph CAPTURE differs from subsequent REPLAY launches —
-            up to 15% deviation in the KKT A tensor sum on TP1 (observed on
-            Qwen3-27B edge-cloud, T=14). This propagates through
-            solve_tril / recompute_w_u_fwd / fwd_o and corrupts the ssm_state
-            written for the first request, producing garbled output.
-
-            Warming up before cudagraph capture forces the kernels to be
-            JIT-compiled and autotuned against a stable input, so the first
-            real request hits the steady-state path.
-
-        Mirrors the upstream signature but adapts to the vllm-ascend
-        ``chunk_gated_delta_rule`` API which requires ``prebuilt_meta=None``,
-        ``head_first=False``, and ``use_qk_l2norm_in_kernel=True``.
-        """
-        if self._prefill_kernels_warmed_up:
-            return
-        self._prefill_kernels_warmed_up = True
-
-        device = qkv_or_qkvz.device
-        dtype = qkv_or_qkvz.dtype
-        num_k_heads = self.num_k_heads // self.tp_size
-        num_v_heads = self.num_v_heads // self.tp_size
-        _, state_dtype = self.get_state_dtype()
-
-        # All kernels use BT = chunk_size (64), so a single pass with
-        # T = chunk_size is sufficient to populate every autotuner cache
-        # and force the KKT Triton kernel to a stable compilation path.
-        T = 64
-        K = self.head_k_dim
-        V = self.head_v_dim
-
-        q = torch.randn(1, T, num_k_heads, K, device=device, dtype=dtype)
-        k = torch.randn(1, T, num_k_heads, K, device=device, dtype=dtype)
-        v = torch.randn(1, T, num_v_heads, V, device=device, dtype=dtype)
-        g = torch.randn(1, T, num_v_heads, device=device, dtype=dtype) * 0.1
-        beta = torch.sigmoid(
-            torch.randn(1, T, num_v_heads, device=device, dtype=dtype))
-        state = torch.zeros(1, num_v_heads, V, K, device=device, dtype=state_dtype)
-        cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
-
-        # chunk_gated_delta_rule_fwd() in chunk.py:79 calls
-        # get_forward_context() unconditionally to fetch num_decodes.
-        # In profile_run there is no active forward context, so we
-        # install a minimal one (attn_metadata=None) for the duration of
-        # the warmup call.
-        from types import SimpleNamespace
-        from vllm import forward_context as _fc_mod
-        prev_fc = _fc_mod._forward_context
-        _fc_mod._forward_context = SimpleNamespace(attn_metadata=None)
-        try:
-            chunk_gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=state,
-                output_final_state=True,
-                cu_seqlens=cu_seqlens,
-                prebuilt_meta=None,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-        except Exception:
-            logger.warning(
-                "GDN prefill kernel warmup (T=%d) failed for layer %s. "
-                "First inference may exhibit KKT non-determinism.",
-                T,
-                self.prefix,
-                exc_info=True,
-            )
-        else:
-            logger.debug(
-                "GDN prefill kernel warmup (T=%d) completed for layer %s",
-                T,
-                self.prefix,
-            )
-        finally:
-            _fc_mod._forward_context = prev_fc
-            del q, k, v, g, beta, state, cu_seqlens
-
-        torch.accelerator.empty_cache()
+        return
 
     def _warmup_prefill_kernels_v0202(self, mixed_qkv: torch.Tensor) -> None:
-        """v0.20.2-style warmup entry point.
-
-        Delegates to ``_warmup_prefill_kernels`` because the vllm-ascend
-        ``chunk_gated_delta_rule`` API does not change between v0.20.2
-        and the current release.
-        """
-        if self._prefill_kernels_warmed_up:
-            return
-        self._warmup_prefill_kernels(mixed_qkv, v_dim=0)
+        return
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return AscendGDNAttentionBackend

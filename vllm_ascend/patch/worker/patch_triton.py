@@ -123,12 +123,37 @@ def _fused_recurrent_packed_decode_pytorch(
 
 
 # [EDGE-DEBUG][方案J] 注入 pytorch fallback（不依赖 HAS_TRITON）
+# 必须同时设置子模块属性和父模块命名空间属性,
+# 否则 qwen_gdn_linear_attn.py 的 `from ... import ...` 拿到的是 import 时刻
+# 复制到父模块命名空间的旧引用 (Triton 版本), 修改子模块属性不生效.
 import logging as _patch_log
+import vllm.model_executor.layers.fla.ops as _fla_ops
+import vllm.model_executor.layers.fla.ops.fused_recurrent as _fla_recurrent
+import vllm.model_executor.layers.fla.ops.fused_gdn_prefill_post_conv as _fla_prefill
+
 _patch_log.getLogger("vllm_ascend.diag").warning(
     "[EDGE-DEBUG][方案J] 强制注入 pytorch fallback 替代 packed_decode Triton kernel "
     "(原条件: if not HAS_TRITON, 当前 HAS_TRITON=%s)", HAS_TRITON
 )
-vllm.model_executor.layers.fla.ops.fused_post_conv_prep = _fused_post_conv_prep_pytorch
-vllm.model_executor.layers.fla.ops.fused_recurrent.fused_recurrent_gated_delta_rule_packed_decode = (
-    _fused_recurrent_packed_decode_pytorch
+
+# 1) 替换子模块实现 (如果后续还有 `from fused_recurrent import X` 会拿到新值)
+_fla_recurrent.fused_recurrent_gated_delta_rule_packed_decode = _fused_recurrent_packed_decode_pytorch
+_fla_prefill.fused_post_conv_prep = _fused_post_conv_prep_pytorch
+
+# 2) 替换父模块命名空间属性 (让已经 `from vllm.model_executor.layers.fla.ops import X`
+#    复制过的旧引用也指向新对象)
+_fla_ops.fused_recurrent_gated_delta_rule_packed_decode = _fused_recurrent_packed_decode_pytorch
+_fla_ops.fused_post_conv_prep = _fused_post_conv_prep_pytorch
+
+# 3) 验证: 检查父模块属性确实换了
+assert (
+    _fla_ops.fused_recurrent_gated_delta_rule_packed_decode
+    is _fused_recurrent_packed_decode_pytorch
+), "方案J 注入失败: 父模块命名空间属性替换未生效"
+assert (
+    _fla_ops.fused_post_conv_prep is _fused_post_conv_prep_pytorch
+), "方案J 注入失败: fused_post_conv_prep 父模块命名空间属性替换未生效"
+_patch_log.getLogger("vllm_ascend.diag").warning(
+    "[EDGE-DEBUG][方案J] 注入验证通过: packed_decode/fused_post_conv_prep "
+    "父模块命名空间属性已替换为 pytorch fallback"
 )

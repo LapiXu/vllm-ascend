@@ -4452,6 +4452,43 @@ class NPUModelRunner(GPUModelRunner):
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
+                # [EDGE-DEBUG] 打印前几次的 hidden state + logits，
+                # 用于对比首请求与稳态请求。如果首请求的 hidden state
+                # 跟稳态不同 → GDN 之前的层有 first-launch 非确定性。
+                # 如果 hidden state 相同但 logits 不同 → LM head (compute_logits)
+                # 有 first-launch 非确定性。两种都不同 → 多层都有问题。
+                _dbg_n = getattr(self, "_edge_debug_logits_call_n", 0)
+                self._edge_debug_logits_call_n = _dbg_n + 1
+                if _dbg_n < 6:
+                    try:
+                        _sh = sample_hidden_states.detach().float()
+                        _lg = logits.detach().float()
+                        _req_ids = list(self.input_batch.req_ids)[:3]
+                        for _ri, _rid in enumerate(_req_ids):
+                            _h = _sh[_ri]
+                            _l = _lg[_ri]
+                            _top5 = _l.topk(5)
+                            _top5_ids = _top5.indices.tolist()
+                            _top5_vals = _top5.values.tolist()
+                            logger.warning(
+                                "[EDGE-DEBUG][logits] call_n=%d req_idx=%d "
+                                "req_id=%s num_sched_tokens=%d "
+                                "hidden_state_sum=%.4f hidden_state_absmax=%.4f "
+                                "logits_top5_ids=%s logits_top5_vals=%s",
+                                _dbg_n, _ri, _rid,
+                                int(scheduler_output.num_scheduled_tokens[
+                                    self.input_batch.req_id_to_index[_rid]
+                                ]) if _rid in self.input_batch.req_id_to_index else -1,
+                                _h.sum().item(),
+                                _h.abs().max().item(),
+                                _top5_ids,
+                                [round(v, 4) for v in _top5_vals],
+                            )
+                    except Exception as ex:
+                        logger.warning(
+                            "[EDGE-DEBUG][logits] call_n=%d log failed: %s",
+                            _dbg_n, type(ex).__name__,
+                        )
             else:
                 # Rare case.
                 assert not self.is_pooling_model

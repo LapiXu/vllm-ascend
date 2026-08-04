@@ -7981,6 +7981,40 @@ class NPUModelRunner(GPUModelRunner):
             self.supports_mm_inputs = original_supports_mm_inputs
             self.max_num_tokens = origin_max_num_tokens
 
+        # [EDGE-FIX] 首调用暖机（first-call warmup）
+        # 数据已经证实：prefill 完全稳态，但 first decode 的 hidden_state
+        # 错乱（sum=247 vs -29），且 input_ids/positions 正确（"Here"@pos=14）。
+        # 错误在 "embedding → GDN decode 之前的层 → GDN → 后续层 → LM head"
+        # 这条链上的某个算子首次调用异常。
+        #
+        # 标准 vllm profile_run 跑各种 cudagraph_size 的 _dummy_run，
+        # 但可能没有用真实首请求的 shape（T=14 prefill + T=1 decode）触发
+        # 所有算子的 first-launch。这里显式补两次 dummy_run，用真实 shape。
+        if self._edge_cloud_enabled and self.edge_cloud_cfg.role == "edge":
+            self._edge_first_call_warmup()
+
+    def _edge_first_call_warmup(self) -> None:
+        """在 profile_run 末尾，额外跑两次 _dummy_run，模拟真实首请求的
+        shape（T=14 prefill + T=1 decode），把所有算子 first-launch 提前
+        触发。输出丢弃。"""
+        try:
+            # 模拟首请求的 14-token prefill
+            logger.info(
+                "[EDGE-FIX][first_call_warmup] running 14-token prefill dummy_run")
+            self._dummy_run(14, with_prefill=True, is_profile=True)
+            # 模拟首请求的 1-token decode
+            logger.info(
+                "[EDGE-FIX][first_call_warmup] running 1-token decode dummy_run")
+            self._dummy_run(1, with_prefill=False, is_profile=True)
+            logger.info(
+                "[EDGE-FIX][first_call_warmup] done")
+        except Exception as e:
+            logger.warning(
+                "[EDGE-FIX][first_call_warmup] failed: %s: %s",
+                type(e).__name__, str(e)[:300],
+                exc_info=True,
+            )
+
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:
             self.is_eplb_warmuped = True

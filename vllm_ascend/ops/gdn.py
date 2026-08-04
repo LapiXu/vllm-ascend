@@ -756,8 +756,36 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_non_spec = l2norm_fwd(query_non_spec)
             key_non_spec = l2norm_fwd(key_non_spec)
-            # Dispatches to the vllm-ascend AscendC custom operator
-            # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
+            # [EDGE-FIX] first-call double-run for npu_recurrent_gated_delta_rule
+            # 数据已证实：prefill 完全稳态、input_ids/positions 正确，但首次
+            # decode 的 hidden_state_sum=247 vs 稳态 -29，符号都反。错误在
+            # npu_recurrent_gated_delta_rule 这个 AscendC kernel 的首次调用。
+            # _dummy_run 跑不到这条路径（warmup 无效已验证）。
+            # 修法：首次调用时跑两次 kernel，丢弃第一次结果，用第二次。
+            # 第二次调用已经进入稳态路径。后续 decode 走快路径（一次）。
+            # 注意：只针对 npu_recurrent_gated_delta_rule 的首次调用，
+            # 不是针对整个请求。GND prefill（chunk_gated_delta_rule）走
+            # Triton 路径，不受影响。
+            _first_call_flag = "_edge_npu_rgdr_first_done"
+            if not getattr(self, _first_call_flag, False):
+                # 先跑一次并丢弃结果（触发 first-launch）
+                _ = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+                    query=query_non_spec.squeeze(0),
+                    key=key_non_spec.squeeze(0),
+                    value=value_non_spec.squeeze(0),
+                    g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
+                    beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
+                    state=ssm_state,
+                    scale=key_non_spec.shape[-1] ** -0.5,
+                    actual_seq_lengths=actual_seq_lengths,
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                )
+                # 设置 flag（在第二次调用前设置，避免递归）
+                setattr(self, _first_call_flag, True)
+                _diag2.warning(
+                    "[EDGE-FIX][npu_rgdr_first_call] ran first call, "
+                    "discarding result, will use second call output")
+            # 真正的调用（第二次或后续）
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
                 query=query_non_spec.squeeze(0),
                 key=key_non_spec.squeeze(0),

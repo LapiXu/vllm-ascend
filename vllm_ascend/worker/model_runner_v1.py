@@ -4522,7 +4522,14 @@ class NPUModelRunner(GPUModelRunner):
                                 ]
                                 _start = sum(_ns_list[:_ri])
                                 _end = _start + _nst
-                                _inp = self.input_ids[_start:_end].tolist()
+                                # self.input_ids 是 CpuGpuBuffer，通过
+                                # .cpu/.gpu 访问实际 tensor。取 GPU 端
+                                # 实时数据（CPU 端可能是 stale）。
+                                _inp_buf = self.input_ids
+                                if hasattr(_inp_buf, "gpu"):
+                                    _inp = _inp_buf.gpu[_start:_end].tolist()
+                                else:
+                                    _inp = _inp_buf[_start:_end].tolist()
                                 _pos = self.positions[_start:_end].tolist()
                                 logger.warning(
                                     "[EDGE-DEBUG][inputs] call_n=%d "

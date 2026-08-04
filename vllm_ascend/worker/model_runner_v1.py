@@ -4503,6 +4503,39 @@ class NPUModelRunner(GPUModelRunner):
                             _top5_ids,
                             [round(v, 4) for v in _top5_vals],
                         )
+                        # [EDGE-FIX] 额外打 input_ids 和 positions，
+                        # 用于验证 prefill → first decode 切换时调度器
+                        # 是否传对了输入。如果 first decode 用了 prefill
+                        # 的最后一个 token 当输入（应该用 first generated
+                        # token），或者 positions 没递增到正确的值，就会
+                        # 看到这里跟稳态不同。仅对 prefill 和 decode#0 打
+                        # （这两个是关键对比点）。
+                        if _kind in ("prefill", "decode#0"):
+                            try:
+                                # 计算该 request 在 self.input_ids 里的
+                                # 起止 offset（用 num_scheduled_tokens
+                                # 累积求和）
+                                _ns_list = [
+                                    int(scheduler_output.num_scheduled_tokens[
+                                        _r])
+                                    for _r in _req_ids
+                                ]
+                                _start = sum(_ns_list[:_ri])
+                                _end = _start + _nst
+                                _inp = self.input_ids[_start:_end].tolist()
+                                _pos = self.positions[_start:_end].tolist()
+                                logger.warning(
+                                    "[EDGE-DEBUG][inputs] call_n=%d "
+                                    "req_id=%s kind=%s "
+                                    "input_ids=%s positions=%s",
+                                    _dbg_call_n, _rid, _kind, _inp, _pos,
+                                )
+                            except Exception as ex:
+                                logger.warning(
+                                    "[EDGE-DEBUG][inputs] call_n=%d "
+                                    "log failed: %s",
+                                    _dbg_call_n, type(ex).__name__,
+                                )
                     self._edge_debug_n_prefills = _dbg_n_prefills
                     self._edge_debug_decode_counts = _dbg_decode_counts
                 except Exception as ex:

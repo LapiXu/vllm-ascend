@@ -4533,8 +4533,10 @@ class NPUModelRunner(GPUModelRunner):
                             except Exception as ex:
                                 logger.warning(
                                     "[EDGE-DEBUG][inputs] call_n=%d "
-                                    "log failed: %s",
-                                    _dbg_call_n, type(ex).__name__,
+                                    "log failed: %s: %s",
+                                    _dbg_call_n,
+                                    type(ex).__name__,
+                                    str(ex)[:200],
                                 )
                     self._edge_debug_n_prefills = _dbg_n_prefills
                     self._edge_debug_decode_counts = _dbg_decode_counts
